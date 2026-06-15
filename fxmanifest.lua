@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'lime'
 description 'lime_redzones — in-game redzone creator'
-version '2.0.0'
+version '1.0.1'
 
 ui_page 'web/index.html'
 
