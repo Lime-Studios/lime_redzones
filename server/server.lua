@@ -86,20 +86,10 @@ local function MergeConfigAdmins()
     end
 end
 
-local DEFAULT_ZONE = {
-    id = '1', name = 'Ambush Zone',
-    coords = { x = 1204.55, y = -1288.42, z = 35.23 },
-    radius = 60.0, colorHex = '#FF0000', colorA = 80,
-    blipSprite = 310, blipColor = 1,
-    rewardItems   = { { name = 'money', amount = 5000 } },
-    streakRewards = { { streak = 3, name = 'armor', amount = 1 }, { streak = 5, name = 'money', amount = 2500 } },
-    reviveCost = 10000, reviveInside = true, reviveDelay = 8000,
-    teleportAway = 30.0, exits = {}, enabled = true,
-}
 
 local function SeedIfEmpty()
     if not next(Data.zones) and Config.SeedDefaultZone ~= false then
-        Data.zones['1'] = DEFAULT_ZONE
+        Data.zones['1'] = Config.DefaultZone
         Data.nextZoneId = 2
         SaveData()
     end
@@ -228,28 +218,64 @@ local function GetIdentifier(src)
     return GetPlayerIdentifierByType(src, 'license') or tostring(src)
 end
 
+local function FrameworkIsAdmin(src)
+    if FWName == 'qbx' then
+        -- QBX: check god then admin permission levels.
+        local ok, isGod = pcall(function() return exports.qbx_core:HasPermission(src, 'god') end)
+        if ok and isGod then return true end
+        local ok2, isAdmin = pcall(function() return exports.qbx_core:HasPermission(src, 'admin') end)
+        if ok2 and isAdmin then return true end
+        -- Fallback: read the player's group.
+        local ok3, grp = pcall(function()
+            local p = exports.qbx_core:GetPlayer(src)
+            return p and p.PlayerData and p.PlayerData.group
+        end)
+        if ok3 and (grp == 'god' or grp == 'admin') then return true end
+        return false
+    elseif FWName == 'qb' then
+        if not FW then return false end
+        -- QB-Core: HasPermission supports a list in newer builds, single string in older.
+        local ok, res = pcall(function()
+            return FW.Functions.HasPermission(src, 'god') or FW.Functions.HasPermission(src, 'admin')
+        end)
+        if ok and res then return true end
+        -- Older QB: HasPermission(src, {'god','admin'})
+        local ok2, res2 = pcall(function() return FW.Functions.HasPermission(src, { 'god', 'admin' }) end)
+        if ok2 and res2 then return true end
+        -- Fallback: GetPermission
+        local ok3, perm = pcall(function() return FW.Functions.GetPermission(src) end)
+        if ok3 and (perm == 'god' or perm == 'admin') then return true end
+        return false
+    elseif FWName == 'esx' then
+        local ok, grp = pcall(function()
+            local p = GetPlayer(src)
+            return p and p.getGroup and p.getGroup()
+        end)
+        if ok and (grp == 'god' or grp == 'admin' or grp == 'superadmin') then return true end
+        return false
+    end
+    return false
+end
+
 local function IsAdmin(src)
     if src == 0 then return true end
+
+    -- 1. ACE permissions
     if IsPlayerAceAllowed(src, 'lime_redzones.admin')
         or IsPlayerAceAllowed(src, 'lime_redzones.god')
         or IsPlayerAceAllowed(src, 'god')
         or IsPlayerAceAllowed(src, 'command') then return true end
 
+    -- 2. Identifier list (config + in-game added admins)
     local lic = GetPlayerIdentifierByType(src, 'license')
     local id  = GetIdentifier(src)
     for _, a in ipairs(Data.settings.admins or {}) do
         local aid = type(a) == 'table' and a.id or a
         if aid == lic or aid == id then return true end
     end
-    if FWName == 'qbx' then
-        local ok, r = pcall(function() return exports.qbx_core:HasPermission(src, 'admin') end)
-        return ok and r
-    elseif FWName == 'qb' then return FW.Functions.HasPermission(src, 'admin')
-    elseif FWName == 'esx' then
-        local p = GetPlayer(src)
-        return p and (p.getGroup() == 'admin' or p.getGroup() == 'superadmin')
-    end
-    return false
+
+    -- 3. Framework admin/god groups
+    return FrameworkIsAdmin(src)
 end
 
 local function PlayerDistFromZone(src, zone)
@@ -276,9 +302,15 @@ local function PlayerInAnyZone(src, slack)
 end
 
 local function GetAdminPerms(src)
-    if src == 0 or IsPlayerAceAllowed(src, 'lime_redzones.god') or IsPlayerAceAllowed(src, 'god') then
+    -- Full access: server console, ACE god, or framework god/admin group.
+    if src == 0
+        or IsPlayerAceAllowed(src, 'lime_redzones.god')
+        or IsPlayerAceAllowed(src, 'god')
+        or FrameworkIsAdmin(src) then
         return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true, _full = true }
     end
+
+    -- Identifier-based admins: apply their assigned rank's section perms.
     local lic = GetPlayerIdentifierByType(src, 'license')
     local id  = GetIdentifier(src)
     for _, a in ipairs(Data.settings.admins or {}) do
@@ -288,6 +320,8 @@ local function GetAdminPerms(src)
             end
         end
     end
+
+    -- ACE lime_redzones.admin or a rankless identifier admin: full section access (not _full).
     return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true }
 end
 
@@ -321,24 +355,11 @@ local function ResetInfo(cfg)
     }
 end
 
-local WEAPON_NAMES = {
-    [453432689] = 'Pistol', [1593441988] = 'Combat Pistol', [-1716589765] = 'Pistol .50',
-    [-1076751822] = 'SNS Pistol', [-771403250] = 'Heavy Pistol', [137902532] = 'Vintage Pistol',
-    [-1063057011] = 'AP Pistol', [-1045183535] = 'Assault Rifle', [-2084633992] = 'Carbine Rifle',
-    [-1357824103] = 'Advanced Rifle', [-1063057001] = 'Special Carbine', [2132975508] = 'Bullpup Rifle',
-    [-494615257] = 'Micro SMG', [324215364] = 'SMG', [736523883] = 'Assault SMG', [-619010992] = 'Combat PDW',
-    [487013001] = 'Pump Shotgun', [2017895192] = 'Sawed-Off', [-1654528753] = 'Bullpup Shotgun',
-    [100416529] = 'Sniper Rifle', [205991906] = 'Heavy Sniper', [-1357824103] = 'Rifle',
-    [-1466123335] = 'Knife', [-122831616] = 'Pistol Mk2', [-1075685676] = 'Pistol Mk2',
-    [3220176749] = 'Heavy Revolver', [-879347409] = 'Revolver', [-853065399] = 'Combat MG',
-    [-1660422300] = 'MG', [911657153] = 'Stun Gun', [615608432] = 'Melee', [-1786099057] = 'Nightstick',
-    [1737195953] = 'Unarmed', [-1569615261] = 'Unarmed',
-}
 
 local function WeaponLabel(w)
     w = tonumber(w)
     if not w then return 'Weapon' end
-    return WEAPON_NAMES[w] or 'Weapon'
+    return (Config.WeaponNames and Config.WeaponNames[w]) or 'Weapon'
 end
 
 local function PushLeaderboard(target)
@@ -529,6 +550,16 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
             duration = Data.settings.options.killFeedDuration or 6000,
         })
     end
+
+    if Log then
+        Log('kills', 'Redzone Kill',
+            ('**%s** killed **%s**'):format(GetPName(src), victimName or 'Enemy'),
+            {
+                { name = 'Zone',   value = zone.name or zoneId, inline = true },
+                { name = 'Weapon', value = WeaponLabel(weapon), inline = true },
+                { name = 'Streak', value = tostring(streak),    inline = true },
+            })
+    end
     SaveData()
     PushLeaderboard(-1)
 end)
@@ -619,6 +650,11 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
     if RemoveCash(src, cost) then
         DoRevive(src, coords, heading)
         if cost > 0 then NotifySv(src, ('Revived — $%s deducted.'):format(cost), 'success') end
+        if Log then
+            Log('revives', 'Paid Revive', ('**%s** revived'):format(GetPName(src)),
+                { { name = 'Zone', value = zone.name or tostring(zoneId), inline = true },
+                  { name = 'Cost', value = '$' .. tostring(cost), inline = true } })
+        end
     else
         NotifySv(src, ('You need $%s cash to be revived here.'):format(cost), 'error')
         TriggerClientEvent('lime_redzones:client:reviveDenied', src)
@@ -723,6 +759,7 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
     BroadcastZones(-1)
     SendAdminData(src)
     NotifySv(src, ('Zone "%s" saved.'):format(Data.zones[id].name), 'success')
+    if Log then Log('admin', 'Zone Saved', ('**%s** saved zone **%s**'):format(GetPName(src), Data.zones[id].name)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:toggleZone', function(zoneId, enabled)
@@ -735,6 +772,7 @@ RegisterNetEvent('lime_redzones:server:toggleZone', function(zoneId, enabled)
     BroadcastZones(-1)
     SendAdminData(src)
     NotifySv(src, ('Zone "%s" %s.'):format(z.name, z.enabled and 'enabled' or 'disabled'), 'success')
+    if Log then Log('admin', 'Zone Toggled', ('**%s** %s zone **%s**'):format(GetPName(src), z.enabled and 'enabled' or 'disabled', z.name)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:deleteZone', function(zoneId)
@@ -748,6 +786,7 @@ RegisterNetEvent('lime_redzones:server:deleteZone', function(zoneId)
     BroadcastZones(-1)
     SendAdminData(src)
     NotifySv(src, ('Zone "%s" deleted.'):format(name), 'success')
+    if Log then Log('admin', 'Zone Deleted', ('**%s** deleted zone **%s**'):format(GetPName(src), name)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:saveGang', function(gang)
@@ -758,6 +797,7 @@ RegisterNetEvent('lime_redzones:server:saveGang', function(gang)
     SaveData()
     SendAdminData(src)
     NotifySv(src, ('Gang "%s" registered.'):format(gang.label or gang.name), 'success')
+    if Log then Log('admin', 'Gang Added', ('**%s** added gang **%s**'):format(GetPName(src), gang.label or gang.name)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:deleteGang', function(name)
@@ -823,6 +863,7 @@ RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
     TriggerClientEvent('lime_redzones:client:syncOptions', -1, o)
     SendAdminData(src)
     NotifySv(src, 'Options saved.', 'success')
+    if Log then Log('admin', 'Options Updated', ('**%s** updated server options'):format(GetPName(src))) end
 end)
 
 RegisterNetEvent('lime_redzones:server:saveRanks', function(ranks)
@@ -849,6 +890,7 @@ RegisterNetEvent('lime_redzones:server:saveRanks', function(ranks)
     SaveData()
     SendAdminData(src)
     NotifySv(src, 'Ranks saved.', 'success')
+    if Log then Log('admin', 'Ranks Updated', ('**%s** updated admin ranks'):format(GetPName(src))) end
 end)
 
 RegisterNetEvent('lime_redzones:server:addAdmin', function(payload)
@@ -864,6 +906,7 @@ RegisterNetEvent('lime_redzones:server:addAdmin', function(payload)
     SaveData()
     SendAdminData(src)
     NotifySv(src, ('Admin added: %s'):format(idStr), 'success')
+    if Log then Log('admin', 'Admin Added', ('**%s** added admin `%s`'):format(GetPName(src), idStr)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:removeAdmin', function(identifier)
@@ -875,6 +918,7 @@ RegisterNetEvent('lime_redzones:server:removeAdmin', function(identifier)
             SaveData()
             SendAdminData(src)
             NotifySv(src, ('Admin removed: %s'):format(identifier), 'success')
+            if Log then Log('admin', 'Admin Removed', ('**%s** removed admin `%s`'):format(GetPName(src), identifier)) end
             return
         end
     end
@@ -886,6 +930,7 @@ RegisterNetEvent('lime_redzones:server:resetLeaderboard', function(which)
     if which == 'global' then DoReset('globalReset') else DoReset('reset') end
     SendAdminData(src)
     NotifySv(src, ('%s leaderboard reset.'):format(which == 'global' and 'Global' or 'Redzone'), 'success')
+    if Log then Log('admin', 'Leaderboard Reset', ('**%s** reset the %s leaderboard'):format(GetPName(src), which == 'global' and 'Global' or 'Redzone')) end
 end)
 
 AddEventHandler('onResourceStop', function(res)
@@ -902,4 +947,54 @@ AddEventHandler('onResourceStart', function(res)
         Wait(500)
         BroadcastZones(-1)
     end)
+end)
+
+-- Build + post a public leaderboard snapshot to the Discord webhook.
+function PostLeaderboardLog(board, top)
+    top = top or 10
+    local store = (board == 'global') and Data.globalLb.players or Data.lb.players
+    local list = {}
+    for id, d in pairs(store) do list[#list+1] = { name = d.name, kills = d.kills or 0, deaths = d.deaths or 0 } end
+    table.sort(list, function(a, b) return a.kills > b.kills end)
+
+    local lines = {}
+    for i = 1, math.min(top, #list) do
+        local p = list[i]
+        local medal = i == 1 and '🥇' or i == 2 and '🥈' or i == 3 and '🥉' or ('**' .. i .. '.**')
+        lines[#lines+1] = ('%s %s — %d kills / %d deaths'):format(medal, p.name or 'Unknown', p.kills, p.deaths)
+    end
+    if #lines == 0 then lines[1] = '_No data yet._' end
+
+    if Log then
+        Log('leaderboard',
+            ('🏆 %s Leaderboard — Top %d'):format(board == 'global' and 'Global' or 'Redzone', math.min(top, #list > 0 and #list or top)),
+            table.concat(lines, '\n'))
+    end
+end
+_G.PostLeaderboardLog = PostLeaderboardLog
+
+-- Admin panel: fetch logs for a category.
+RegisterNetEvent('lime_redzones:server:requestLogs', function(category)
+    local src = source
+    if not HasPerm(src, 'options') then return end
+    if GetLogs then
+        TriggerClientEvent('lime_redzones:client:logs', src, category, GetLogs(category, 50))
+    end
+end)
+
+-- Admin panel: update log config live (toggles, webhooks, auto-post).
+RegisterNetEvent('lime_redzones:server:saveLogConfig', function(patch)
+    local src = source
+    if not GetAdminPerms(src)._full then NotifySv(src, 'Only full admins can change logging.', 'error') return end
+    if SetLogConfig then SetLogConfig(patch) end
+    NotifySv(src, 'Logging settings saved.', 'success')
+    if Log then Log('admin', 'Logging Updated', ('**%s** changed logging settings'):format(GetPName(src))) end
+end)
+
+RegisterNetEvent('lime_redzones:server:requestLogConfig', function()
+    local src = source
+    if not HasPerm(src, 'options') then return end
+    if GetLogConfig then
+        TriggerClientEvent('lime_redzones:client:logConfig', src, GetLogConfig())
+    end
 end)

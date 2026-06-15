@@ -158,6 +158,13 @@ end
 
 RegisterNetEvent('lime_redzones:client:notify', function(m, t, d) Notify(m, t, d) end)
 
+RegisterNetEvent('lime_redzones:client:logs', function(category, entries)
+    SendNUIMessage({ type = 'logs', category = category, entries = entries })
+end)
+RegisterNetEvent('lime_redzones:client:logConfig', function(cfg)
+    SendNUIMessage({ type = 'logConfig', config = cfg })
+end)
+
 RegisterNetEvent('lime_redzones:client:killFeed', function(entry)
     if type(entry) ~= 'table' then return end
     SendNUIMessage({ type = 'killFeed', entry = entry })
@@ -271,6 +278,18 @@ RegisterNUICallback('saveKillfeedStyle', function(d, cb)
     cb({})
 end)
 
+RegisterNUICallback('requestLogs', function(d, cb)
+    TriggerServerEvent('lime_redzones:server:requestLogs', d.category or 'admin')
+    cb({})
+end)
+RegisterNUICallback('requestLogConfig', function(_, cb)
+    TriggerServerEvent('lime_redzones:server:requestLogConfig')
+    cb({})
+end)
+RegisterNUICallback('saveLogConfig', function(d, cb)
+    TriggerServerEvent('lime_redzones:server:saveLogConfig', d)
+    cb({})
+end)
 RegisterNUICallback('saveKillMsgStyle', function(d, cb)
     if d.scale then SetResourceKvpFloat('rz_km_scale', tonumber(d.scale) or 1.0) end
     if d.theme then SetResourceKvp('rz_km_theme', tostring(d.theme)) end
