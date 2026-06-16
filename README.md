@@ -32,7 +32,7 @@ An in-game redzone creator for FiveM with a tablet-style admin panel, live leade
    ensure oxmysql
    ensure lime_redzones
    ```
-5. Start the server. A default "Ambush Zone" is seeded on first run (disable this with `Config.SeedDefaultZone = false`).
+5. Start the server. **Fresh installs have zero redzones** — open the admin tablet with `/rz_admin` and create your first zone in-game.
 
 ## Commands
 

@@ -136,6 +136,7 @@ local function SetTablet(open, mode, tab, payload)
         killmsgPos = kvpJson('rz_km_pos'),
         killmsgScale = tonumber(GetResourceKvpFloat('rz_km_scale')) or 1.0,
         killmsgTheme = GetResourceKvpString('rz_km_theme') or 'inherit',
+        firstTime = GetResourceKvpString('rz_seen_tutorial') ~= 'yes',
     })
     if not hudMoveMode then
         if open then
@@ -163,6 +164,9 @@ RegisterNetEvent('lime_redzones:client:logs', function(category, entries)
 end)
 RegisterNetEvent('lime_redzones:client:logConfig', function(cfg)
     SendNUIMessage({ type = 'logConfig', config = cfg })
+end)
+RegisterNetEvent('lime_redzones:client:prizeHistory', function(history)
+    SendNUIMessage({ type = 'prizeHistory', history = history })
 end)
 
 RegisterNetEvent('lime_redzones:client:killFeed', function(entry)
@@ -224,7 +228,19 @@ end, false)
 RegisterCommand('rz_color', function() OpenPlayerTablet('color') end, false)
 RegisterCommand('rz_hud', function() SetHudMove(not hudMoveMode) end, false)
 
+-- Register a callback that just forwards data to a server event.
+local function forward(name, event, arg)
+    RegisterNUICallback(name, function(d, cb)
+        TriggerServerEvent(event, arg and arg(d) or nil)
+        cb({})
+    end)
+end
+
 RegisterNUICallback('closeTablet', function(_, cb) SetTablet(false) cb({}) end)
+RegisterNUICallback('tutorialSeen', function(_, cb)
+    SetResourceKvp('rz_seen_tutorial', 'yes')
+    cb({})
+end)
 RegisterNUICallback('forceClose', function(_, cb)
     tabletOpen, hudMoveMode = false, false
     SetNuiFocus(false, false)
@@ -241,26 +257,12 @@ RegisterNUICallback('openPlayerTablet', function(_, cb)
     cb({})
 end)
 
-RegisterNUICallback('addAdminId', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:addAdmin', tostring(d.identifier or ''))
-    cb({})
-end)
-RegisterNUICallback('removeAdminId', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:removeAdmin', tostring(d.identifier or ''))
-    cb({})
-end)
-RegisterNUICallback('getMyIdentifier', function(_, cb)
-    TriggerServerEvent('lime_redzones:server:myIdentifier')
-    cb({})
-end)
+forward('addAdminId', 'lime_redzones:server:addAdmin', function(d) return tostring(d.identifier or '') end)
+forward('removeAdminId', 'lime_redzones:server:removeAdmin', function(d) return tostring(d.identifier or '') end)
+forward('getMyIdentifier', 'lime_redzones:server:myIdentifier')
 
-RegisterNUICallback('toggleZone', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:toggleZone', d.id, d.enabled)
-    cb({})
-end)
-RegisterNUICallback('saveRanks', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:saveRanks', d.ranks) cb({})
-end)
+RegisterNUICallback('toggleZone', function(d, cb) TriggerServerEvent('lime_redzones:server:toggleZone', d.id, d.enabled) cb({}) end)
+forward('saveRanks', 'lime_redzones:server:saveRanks', function(d) return d.ranks end)
 RegisterNUICallback('saveHudTheme', function(d, cb)
     if d.theme then SetResourceKvp('rz_hud_theme', tostring(d.theme)) end
     if d.preset then SetResourceKvp('rz_hud_preset', tostring(d.preset)) end
@@ -278,18 +280,11 @@ RegisterNUICallback('saveKillfeedStyle', function(d, cb)
     cb({})
 end)
 
-RegisterNUICallback('requestLogs', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:requestLogs', d.category or 'admin')
-    cb({})
-end)
-RegisterNUICallback('requestLogConfig', function(_, cb)
-    TriggerServerEvent('lime_redzones:server:requestLogConfig')
-    cb({})
-end)
-RegisterNUICallback('saveLogConfig', function(d, cb)
-    TriggerServerEvent('lime_redzones:server:saveLogConfig', d)
-    cb({})
-end)
+forward('requestLogs', 'lime_redzones:server:requestLogs', function(d) return d.category or 'admin' end)
+forward('requestLogConfig', 'lime_redzones:server:requestLogConfig')
+forward('postLeaderboardNow', 'lime_redzones:server:postLeaderboardNow', function(d) return d.board or 'redzone' end)
+forward('requestPrizeHistory', 'lime_redzones:server:requestPrizeHistory')
+forward('saveLogConfig', 'lime_redzones:server:saveLogConfig', function(d) return d end)
 RegisterNUICallback('saveKillMsgStyle', function(d, cb)
     if d.scale then SetResourceKvpFloat('rz_km_scale', tonumber(d.scale) or 1.0) end
     if d.theme then SetResourceKvp('rz_km_theme', tostring(d.theme)) end
@@ -455,7 +450,7 @@ end)
 CreateThread(function()
     local frame = 0
     while true do
-        local renderDist = DynRenderDist or Config.RenderDistance or 120.0
+        local renderDist = DynRenderDist or 120.0
         if not next(Zones) then Wait(2500) goto continue end
 
         local ped = PlayerPedId()
@@ -588,14 +583,19 @@ CreateThread(function()
     local wasDeadGlobal = false
     while true do
         Wait(1500)
-        local dead = IsEntityDead(PlayerPedId())
-        if dead and not wasDeadGlobal then
-            wasDeadGlobal = true
-            if not currentZoneId then
-                TriggerServerEvent('lime_redzones:server:globalDeath')
-            end
-        elseif not dead and wasDeadGlobal then
+        -- Skip entirely if global leaderboard is disabled.
+        if Opts.globalLbEnabled == false then
             wasDeadGlobal = false
+        else
+            local dead = IsEntityDead(PlayerPedId())
+            if dead and not wasDeadGlobal then
+                wasDeadGlobal = true
+                if not currentZoneId then
+                    TriggerServerEvent('lime_redzones:server:globalDeath')
+                end
+            elseif not dead and wasDeadGlobal then
+                wasDeadGlobal = false
+            end
         end
     end
 end)

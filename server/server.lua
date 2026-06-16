@@ -5,11 +5,18 @@ elseif GetResourceState('es_extended') == 'started' then FW, FWName = exports['e
 
 local HasSQL = GetResourceState('oxmysql') == 'started'
 
+-- Re-check oxmysql at boot (it may not have reported 'started' when this file first parsed).
+local function RefreshSQL()
+    HasSQL = GetResourceState('oxmysql') == 'started'
+    return HasSQL
+end
+
 local Data = {
     zones = {}, customGangs = {}, nextZoneId = 1,
     lb       = { players = {}, gangs = {} },
     globalLb = { players = {} },
     pendingPrizes = {},
+    prizeHistory = {},  -- past leaderboard winners: { board, name, identifier, prize, time }
     settings = {
         reset       = { enabled = false, day = 0, hour = 18, prizeName = 'money', prizeAmount = 50000, lastReset = 0 },
         globalReset = { enabled = false, day = 0, hour = 18, prizeName = 'money', prizeAmount = 25000, lastReset = 0 },
@@ -23,6 +30,12 @@ local Data = {
             killFeedDuration = 6000, killCamDuration = 5000,
             lbCols = { kills = true, deaths = true, kd = true, streak = false },
         },
+        logs = {
+            enabled = true,
+            categories = { admin = true, kills = false, revives = true },
+            webhooks = { admin = '', kills = '', revives = '', leaderboardRz = '', leaderboardGlobal = '' },
+            leaderboardPost = { enabled = false, board = 'redzone', interval = 30, top = 10 },
+        },
         admins      = {},
         ranks       = {
             { name = 'Moderator', perms = { zones = false, gangs = false, leaderboards = true, options = false, killfeed = false } },
@@ -33,8 +46,16 @@ local Data = {
 
 local saveQueued = false
 local function WriteNow()
-    if not HasSQL then return end
-    exports.oxmysql:update('UPDATE lime_redzones SET data = ? WHERE id = 1', { json.encode(Data) })
+    if not HasSQL then
+        print('^3[lime_redzones] WriteNow skipped — no SQL. Data is NOT persisting.^0')
+        return
+    end
+    exports.oxmysql:update('UPDATE lime_redzones SET data = ? WHERE id = 1', { json.encode(Data) }, function(affected)
+        if affected == 0 then
+            -- Row 1 missing (e.g. table recreated) — insert it so future saves work.
+            exports.oxmysql:insert('INSERT INTO lime_redzones (id, data) VALUES (1, ?) ON DUPLICATE KEY UPDATE data = VALUES(data)', { json.encode(Data) })
+        end
+    end)
 end
 
 function SaveData()
@@ -87,15 +108,11 @@ local function MergeConfigAdmins()
 end
 
 
-local function SeedIfEmpty()
-    if not next(Data.zones) and Config.SeedDefaultZone ~= false then
-        Data.zones['1'] = Config.DefaultZone
-        Data.nextZoneId = 2
-        SaveData()
-    end
-end
+-- Fresh installs start with zero redzones. Admins create them in-game.
+local function SeedIfEmpty() end
 
 local function LoadData(done)
+    RefreshSQL()
     if not HasSQL then
         print('^1[lime_redzones] oxmysql not started — running in-memory (data will NOT persist). Add oxmysql as a dependency.^0')
         SeedIfEmpty()
@@ -220,12 +237,10 @@ end
 
 local function FrameworkIsAdmin(src)
     if FWName == 'qbx' then
-        -- QBX: check god then admin permission levels.
         local ok, isGod = pcall(function() return exports.qbx_core:HasPermission(src, 'god') end)
         if ok and isGod then return true end
         local ok2, isAdmin = pcall(function() return exports.qbx_core:HasPermission(src, 'admin') end)
         if ok2 and isAdmin then return true end
-        -- Fallback: read the player's group.
         local ok3, grp = pcall(function()
             local p = exports.qbx_core:GetPlayer(src)
             return p and p.PlayerData and p.PlayerData.group
@@ -242,7 +257,6 @@ local function FrameworkIsAdmin(src)
         -- Older QB: HasPermission(src, {'god','admin'})
         local ok2, res2 = pcall(function() return FW.Functions.HasPermission(src, { 'god', 'admin' }) end)
         if ok2 and res2 then return true end
-        -- Fallback: GetPermission
         local ok3, perm = pcall(function() return FW.Functions.GetPermission(src) end)
         if ok3 and (perm == 'god' or perm == 'admin') then return true end
         return false
@@ -260,13 +274,11 @@ end
 local function IsAdmin(src)
     if src == 0 then return true end
 
-    -- 1. ACE permissions
     if IsPlayerAceAllowed(src, 'lime_redzones.admin')
         or IsPlayerAceAllowed(src, 'lime_redzones.god')
         or IsPlayerAceAllowed(src, 'god')
         or IsPlayerAceAllowed(src, 'command') then return true end
 
-    -- 2. Identifier list (config + in-game added admins)
     local lic = GetPlayerIdentifierByType(src, 'license')
     local id  = GetIdentifier(src)
     for _, a in ipairs(Data.settings.admins or {}) do
@@ -274,7 +286,6 @@ local function IsAdmin(src)
         if aid == lic or aid == id then return true end
     end
 
-    -- 3. Framework admin/god groups
     return FrameworkIsAdmin(src)
 end
 
@@ -387,9 +398,7 @@ local function PushLeaderboard(target)
     TriggerClientEvent('lime_redzones:client:updateLeaderboard', target or -1,
         cap(pList, 30), cap(gList, 30), cap(glList, 30),
         {
-            -- RZ board totals
             kills = rzKills, deaths = rzDeaths, players = #pList,
-            -- Global board totals (separate)
             globalKills = glKills, globalDeaths = glDeaths, globalPlayersCount = #glList,
             reset = ResetInfo(Data.settings.reset),
             globalReset = ResetInfo(Data.settings.globalReset),
@@ -431,6 +440,24 @@ local function DoReset(which)
         end
         if top and topKills > 0 then
             GrantPrizeOrQueue(top, cfg.prizeName or 'money', cfg.prizeAmount)
+            Data.prizeHistory = Data.prizeHistory or {}
+            table.insert(Data.prizeHistory, 1, {
+                board = which == 'reset' and 'redzone' or 'global',
+                name = (store[top] and store[top].name) or 'Unknown',
+                identifier = top,
+                prize = { name = cfg.prizeName or 'money', amount = cfg.prizeAmount },
+                kills = topKills,
+                time = os.time(),
+            })
+            -- Keep the last 50 winners.
+            while #Data.prizeHistory > 50 do table.remove(Data.prizeHistory) end
+            if Log then
+                Log(which == 'reset' and 'leaderboardRz' or 'leaderboardGlobal', '🏆 Leaderboard Winner',
+                    ('**%s** won the %s leaderboard with **%d kills**'):format(
+                        (store[top] and store[top].name) or 'Unknown',
+                        which == 'reset' and 'Redzone' or 'Global', topKills),
+                    { { name = 'Prize', value = (cfg.prizeName == 'money' and ('$' .. cfg.prizeAmount) or (cfg.prizeAmount .. 'x ' .. cfg.prizeName)), inline = true } })
+            end
         end
     end
 
@@ -610,6 +637,9 @@ end)
 RegisterNetEvent('lime_redzones:server:globalDeath', function()
     if Data.settings.options.globalLbEnabled == false then return end
     local src = source
+    local now = os.clock()
+    if lastDeath[src] and (now - lastDeath[src]) < 3.0 then return end
+    lastDeath[src] = now
     local lb = EnsureP(Data.globalLb.players, src)
     lb.deaths = lb.deaths + 1
     SaveData()
@@ -949,7 +979,6 @@ AddEventHandler('onResourceStart', function(res)
     end)
 end)
 
--- Build + post a public leaderboard snapshot to the Discord webhook.
 function PostLeaderboardLog(board, top)
     top = top or 10
     local store = (board == 'global') and Data.globalLb.players or Data.lb.players
@@ -973,7 +1002,36 @@ function PostLeaderboardLog(board, top)
 end
 _G.PostLeaderboardLog = PostLeaderboardLog
 
--- Admin panel: fetch logs for a category.
+-- Live log settings accessor for bridge/logs.lua (reads persisted Data.settings.logs).
+function GetLogSettings()
+    return Data.settings.logs or { enabled = true, categories = {}, webhooks = {}, leaderboardPost = {} }
+end
+
+-- Build + post a public leaderboard snapshot. board: 'redzone' | 'global'
+function PostLeaderboardLog(board, top)
+    top = top or 10
+    local isGlobal = (board == 'global')
+    local store = isGlobal and Data.globalLb.players or Data.lb.players
+    local list = {}
+    for _, d in pairs(store) do list[#list+1] = { name = d.name, kills = d.kills or 0, deaths = d.deaths or 0 } end
+    table.sort(list, function(a, b) return a.kills > b.kills end)
+
+    local lines = {}
+    for i = 1, math.min(top, #list) do
+        local p = list[i]
+        local medal = i == 1 and '🥇' or i == 2 and '🥈' or i == 3 and '🥉' or ('**' .. i .. '.**')
+        lines[#lines+1] = ('%s %s — %d kills / %d deaths'):format(medal, p.name or 'Unknown', p.kills, p.deaths)
+    end
+    if #lines == 0 then lines[1] = '_No data yet._' end
+
+    if Log then
+        Log(isGlobal and 'leaderboardGlobal' or 'leaderboardRz',
+            ('🏆 %s Leaderboard — Top %d'):format(isGlobal and 'Global' or 'Redzone', math.min(top, math.max(#list, 1))),
+            table.concat(lines, '\n'))
+    end
+end
+_G.PostLeaderboardLog = PostLeaderboardLog
+
 RegisterNetEvent('lime_redzones:server:requestLogs', function(category)
     local src = source
     if not HasPerm(src, 'options') then return end
@@ -982,11 +1040,29 @@ RegisterNetEvent('lime_redzones:server:requestLogs', function(category)
     end
 end)
 
--- Admin panel: update log config live (toggles, webhooks, auto-post).
 RegisterNetEvent('lime_redzones:server:saveLogConfig', function(patch)
     local src = source
     if not GetAdminPerms(src)._full then NotifySv(src, 'Only full admins can change logging.', 'error') return end
-    if SetLogConfig then SetLogConfig(patch) end
+    if type(patch) ~= 'table' then return end
+
+    local L = Data.settings.logs
+    if patch.enabled ~= nil then L.enabled = patch.enabled == true end
+    if type(patch.categories) == 'table' then
+        L.categories = L.categories or {}
+        for k, v in pairs(patch.categories) do L.categories[k] = v == true end
+    end
+    if type(patch.webhooks) == 'table' then
+        L.webhooks = L.webhooks or {}
+        for k, v in pairs(patch.webhooks) do if type(v) == 'string' then L.webhooks[k] = v end end
+    end
+    if type(patch.leaderboardPost) == 'table' then
+        L.leaderboardPost = L.leaderboardPost or {}
+        for k, v in pairs(patch.leaderboardPost) do L.leaderboardPost[k] = v end
+        L.leaderboardPost.interval = math.max(1, math.floor(tonumber(L.leaderboardPost.interval) or 30))
+        L.leaderboardPost.top = math.max(3, math.min(25, math.floor(tonumber(L.leaderboardPost.top) or 10)))
+    end
+
+    SaveData()  -- persist log settings to SQL
     NotifySv(src, 'Logging settings saved.', 'success')
     if Log then Log('admin', 'Logging Updated', ('**%s** changed logging settings'):format(GetPName(src))) end
 end)
@@ -994,7 +1070,22 @@ end)
 RegisterNetEvent('lime_redzones:server:requestLogConfig', function()
     local src = source
     if not HasPerm(src, 'options') then return end
-    if GetLogConfig then
-        TriggerClientEvent('lime_redzones:client:logConfig', src, GetLogConfig())
-    end
+    TriggerClientEvent('lime_redzones:client:logConfig', src, GetLogSettings())
+end)
+
+-- Instant "send now" — post a leaderboard snapshot immediately.
+RegisterNetEvent('lime_redzones:server:postLeaderboardNow', function(board)
+    local src = source
+    if not HasPerm(src, 'options') then return end
+    board = (board == 'global') and 'global' or 'redzone'
+    local top = (Data.settings.logs.leaderboardPost and Data.settings.logs.leaderboardPost.top) or 10
+    PostLeaderboardLog(board, top)
+    NotifySv(src, ('Posted %s leaderboard to Discord.'):format(board == 'global' and 'Global' or 'Redzone'), 'success')
+    if Log then Log('admin', 'Leaderboard Posted', ('**%s** manually posted the %s leaderboard'):format(GetPName(src), board == 'global' and 'Global' or 'Redzone')) end
+end)
+
+-- Send prize history to a requesting player (public — anyone can see past winners).
+RegisterNetEvent('lime_redzones:server:requestPrizeHistory', function()
+    local src = source
+    TriggerClientEvent('lime_redzones:client:prizeHistory', src, Data.prizeHistory or {})
 end)

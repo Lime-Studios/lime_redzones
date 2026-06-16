@@ -1,58 +1,34 @@
+-- ═══════════════════════════════════════════════════════════════
+--  lime_redzones — minimal config
+--
+--  Almost everything is managed IN-GAME via the admin tablet (/rz_admin)
+--  and saved to your database. This file only holds a few things that
+--  must exist before the script boots (keybinds) or are just lookup data.
+--
+--  Fresh installs start with ZERO redzones — create them in-game.
+-- ═══════════════════════════════════════════════════════════════
+
 Config = {}
 
--- ─────────────────────────────────────────────────────────────
---  GENERAL
--- ─────────────────────────────────────────────────────────────
-Config.RenderDistance = 120.0            -- default dome render distance past a zone's edge (admins can override in-game)
-Config.LeaderboardKey = 'F1'             -- keybind to open the leaderboard
-Config.LeaderboardKeybindEnabled = true  -- set false to disable the keybind entirely
-Config.SeedDefaultZone = true            -- seed a starter zone on first boot (see Config.DefaultZone)
+-- Keybind to open the leaderboard. Keybinds must be registered at startup,
+-- so this one lives here. Players can rebind it in GTA Settings > Key Bindings.
+Config.LeaderboardKeybindEnabled = true
+Config.LeaderboardKey            = 'F1'
 
--- Static admins (ACE perms and framework admin groups also work).
--- Entries can be a plain identifier string, or { id = 'license:..', rank = 'Admin' }.
+-- OPTIONAL bootstrap admin(s) so you can get into the panel on a brand-new install.
+-- After that, manage admins/ranks entirely in-game. ACE perms and framework
+-- god/admin groups also grant access, so you can usually leave this empty.
+--   Entry formats:  'license:xxxx'   or   { id = 'license:xxxx', rank = 'Admin' }
 Config.Admins = {
     -- 'license:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-    -- { id = 'license:xxxx', rank = 'Moderator' },
 }
 
--- ─────────────────────────────────────────────────────────────
---  LOGGING  (Discord webhooks + in-game admin log)
--- ─────────────────────────────────────────────────────────────
-Config.Logs = {
-    enabled = true,            -- master switch for all logging
-    keepInMemory = 200,        -- recent entries kept per category for the admin panel
+-- Logging buffer/appearance (everything else about logging is in the panel & saved to DB).
+Config.LogKeepInMemory = 200          -- recent log entries kept per category for the panel
+Config.LogColor        = 10672181     -- Discord embed colour (decimal) — #A3E635
 
-    -- Paste Discord webhook URLs here. Empty = skip Discord for that category
-    -- (it still shows in the in-game admin panel if enabled below).
-    webhooks = {
-        admin       = '',      -- zone edits, option changes, rank/admin changes, resets
-        kills       = '',      -- kills inside redzones
-        revives     = '',      -- paid revives
-        leaderboard = '',      -- periodic public leaderboard snapshot
-    },
-
-    -- Per-category toggles (also configurable live from the admin panel).
-    categories = {
-        admin   = true,
-        kills   = false,       -- high-volume; off by default
-        revives = true,
-    },
-
-    -- Public leaderboard auto-post.
-    leaderboardPost = {
-        enabled  = false,
-        interval = 30,         -- minutes between posts
-        board    = 'redzone',  -- 'redzone' or 'global'
-        top      = 10,
-    },
-
-    color = 10672181,          -- embed colour (decimal) #A3E635
-}
-
--- ─────────────────────────────────────────────────────────────
---  WEAPON NAMES  (hash → readable label for kill feed/logs)
---  Add or correct entries here without touching server code.
--- ─────────────────────────────────────────────────────────────
+-- Weapon hash → readable label (used in kill feed / logs). Pure lookup data;
+-- add entries here if you use custom weapons.
 Config.WeaponNames = {
     [453432689]  = 'Pistol',          [1593441988]  = 'Combat Pistol',
     [-1716589765]= 'Pistol .50',      [-1076751822] = 'SNS Pistol',
@@ -70,18 +46,4 @@ Config.WeaponNames = {
     [911657153]  = 'Stun Gun',        [615608432]   = 'Melee',
     [-1786099057]= 'Nightstick',      [1737195953]  = 'Unarmed',
     [-1569615261]= 'Unarmed',
-}
-
--- ─────────────────────────────────────────────────────────────
---  DEFAULT ZONE  (first boot only, if Config.SeedDefaultZone = true)
--- ─────────────────────────────────────────────────────────────
-Config.DefaultZone = {
-    id = '1', name = 'Ambush Zone',
-    coords = { x = 1204.55, y = -1288.42, z = 35.23 },
-    radius = 60.0, colorHex = '#FF0000', colorA = 80,
-    blipSprite = 310, blipColor = 1,
-    rewardItems   = { { name = 'money', amount = 5000 } },
-    streakRewards = { { streak = 3, name = 'armor', amount = 1 }, { streak = 5, name = 'money', amount = 2500 } },
-    reviveCost = 10000, reviveInside = true, reviveDelay = 8000,
-    teleportAway = 30.0, exits = {}, enabled = true,
 }
