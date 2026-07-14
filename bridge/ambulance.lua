@@ -1,13 +1,7 @@
--- Client-side ambulance integration + guaranteed revive.
---
--- TriggerEvent never errors just because nothing is listening, so it can't
--- tell us whether a framework's revive actually happened — a wrong event
--- name for someone's installed version used to fail completely silently.
--- Every path below now finishes with a health check: if the player is
--- still dead after giving the framework a moment to act, we force a native
--- resurrect so revive always works regardless of which job is installed.
+-- Every path here ends with a health check + native resurrect fallback,
+-- since TriggerEvent doesn't error when nothing's listening for it.
 
--- All ambulance resources this script knows how to hand a revive to.
+-- Ambulance resources this script knows how to hand a revive to.
 local AMBULANCE_RESOURCES = {
     'wasabi_ambulance', 'osp_ambulance', 'esx-ambulancejob', 'esx_ambulancejob',
     'qb-ambulancejob', 'qbx_medical', 'qs-ambulancejob', 'ars_ambulancejob',
@@ -39,9 +33,7 @@ local function nativeResurrect(coords, heading)
     ClearPedTasksImmediately(ped)
 end
 
--- Give whichever framework revive we triggered a moment to take effect,
--- then force a native resurrect if the player is still dead. This is what
--- actually guarantees revives work — not the (unreliable) event trigger.
+-- Force a native resurrect if the player is still dead after the framework's revive.
 local function ensureAlive(coords, heading, delay)
     SetTimeout(delay or 900, function()
         if IsEntityDead(PlayerPedId()) then
@@ -54,9 +46,7 @@ RegisterNetEvent('lime_redzones:client:postReviveTeleport', function(coords, hea
     SetTimeout(500, function() teleportTo(coords, heading) end)
 end)
 
--- Sent after a server-side export revive reports success — still verifies,
--- since a successful export call doesn't guarantee the framework actually
--- cleared the player's dead state (version mismatches, custom death systems).
+-- Sent after a server-side export revive reports success — still verifies.
 RegisterNetEvent('lime_redzones:client:verifyRevive', function(coords, heading)
     ensureAlive(coords, heading, 900)
 end)
@@ -92,14 +82,12 @@ RegisterNetEvent('lime_redzones:client:doRevive', function(coords, heading)
     end
 
     SetTimeout(500, function() teleportTo(coords, heading) end)
-    -- Regardless of which branch ran (or none did), confirm it worked.
     ensureAlive(coords, heading, 1200)
 end)
 
 RegisterNetEvent('lime_redzones:client:reviveDenied', function()
     SetTimeout(5000, function()
-        -- Only force a fallback resurrect if no supported ambulance job is
-        -- running at all — if one is, let it own the death/revive flow.
+        -- Only force it if no ambulance job owns the revive flow.
         if IsEntityDead(PlayerPedId()) and not AmbulanceJobRunning() then
             nativeResurrect(nil, GetEntityHeading(PlayerPedId()))
         end

@@ -98,11 +98,10 @@
     : lbData.players
   )
 
-  // My identifier(s) so I can highlight + find my own row.
   const myKey = $derived(myIds ? (myIds.identifier || myIds.license) : null)
   const isMe = (item) => myKey && (item.id === myKey || item.id === myIds?.license || item.id === myIds?.identifier)
 
-  // The raw list is already rank-ordered (by kills). Tag each with its true rank first.
+  // Tag each with its true rank before filtering/sorting.
   const lbRanked = $derived((lbRaw ?? []).map((it, idx) => ({ ...it, _rank: idx + 1 })))
 
   const lbList = $derived.by(() => {
@@ -118,7 +117,6 @@
     return arr
   })
 
-  // My current standing (for the HUB).
   const myStanding = $derived(lbRanked.find(isMe) ?? null)
   const myWins = $derived((prizeHistory ?? []).filter(w => myKey && (w.identifier === myKey || w.identifier === myIds?.license || w.identifier === myIds?.identifier)))
   const fmtDate = (t) => { try { return new Date((t ?? 0) * 1000).toLocaleDateString() } catch { return '' } }

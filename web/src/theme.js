@@ -1,10 +1,5 @@
-// ════════════════════════════════════════════════════════════
-//  THEME CONFIG — edit colours here to restyle the whole UI.
-//
-//  Each theme has an accent colour (and a text colour for the HUD
-//  blade, which sits on top of the accent). Add a theme by adding
-//  an entry here — it appears everywhere automatically.
-// ════════════════════════════════════════════════════════════
+// Edit colours here to restyle the whole UI. Add a theme by adding an
+// entry — it appears everywhere (HUD, kill feed, kill cam, panel) automatically.
 
 export const THEMES = {
   lime:    { accent: '#A3E635', text: '#0a0b0d' },

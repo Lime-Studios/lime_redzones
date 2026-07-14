@@ -355,8 +355,7 @@ end
 local streaks, lastKill, lastDeath, lastGlobal, lastRevive = {}, {}, {}, {}, {}
 local lastRequest = {}
 
--- Lightweight spam guard for read-only request events.
--- Keyed per event so different requests fired together don't block each other.
+-- Spam guard for request events, keyed per event so they don't block each other.
 local function reqOk(src, gap, key)
     key = key or 'default'
     lastRequest[src] = lastRequest[src] or {}
@@ -723,11 +722,13 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
 end)
 
 RegisterNetEvent('lime_redzones:server:requestLeaderboard', function()
-    if Data.settings.options.leaderboardEnabled == false and not IsAdmin(source) then
-        NotifySv(source, 'The leaderboard is currently disabled.', 'error')
+    local src = source
+    if not reqOk(src, 1.0, 'leaderboard') then return end
+    if Data.settings.options.leaderboardEnabled == false and not IsAdmin(src) then
+        NotifySv(src, 'The leaderboard is currently disabled.', 'error')
         return
     end
-    PushLeaderboard(source)
+    PushLeaderboard(src)
 end)
 RegisterNetEvent('lime_redzones:server:requestZones', function()
     if not reqOk(source, 1.0, 'zones') then return end
@@ -738,6 +739,7 @@ end)
 RegisterNetEvent('lime_redzones:server:myIdentifier', function()
     local src = source
     if not IsAdmin(src) then return end
+    if not reqOk(src, 1.0, 'myid') then return end
     TriggerClientEvent('lime_redzones:client:myIdentifier', src,
         GetPlayerIdentifierByType(src, 'license') or '', GetIdentifier(src))
 end)
@@ -754,6 +756,7 @@ end
 RegisterNetEvent('lime_redzones:server:adminOpen', function()
     local src = source
     if not IsAdmin(src) then NotifySv(src, 'No permission.', 'error') return end
+    if not reqOk(src, 1.0, 'adminopen') then return end
     TriggerClientEvent('lime_redzones:client:openAdmin', src, Data.zones, Data.customGangs, Data.settings, GetAdminPerms(src))
 end)
 

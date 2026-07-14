@@ -1,9 +1,5 @@
--- Tries each supported ambulance job's server-side revive export.
--- Only genuine export calls are trusted as "success" (a missing/broken export
--- throws and pcall catches it) — TriggerEvent/TriggerClientEvent never throw
--- even when nothing is listening, so they can't be used to detect success.
--- If nothing verifiably worked, hand off to the client for its own attempt
--- plus a guaranteed native-resurrect fallback.
+-- Only trusts genuine export calls as success (pcall catches a broken export) —
+-- TriggerClientEvent never throws, so it can't be used to detect success.
 function DoRevive(src, coords, heading)
 
     if GetResourceState('wasabi_ambulance') == 'started' then
@@ -36,8 +32,6 @@ function DoRevive(src, coords, heading)
         end
     end
 
-    -- No verified server-side export worked — let the client try its own
-    -- event-based integrations, with a guaranteed native fallback if those
-    -- don't actually bring the player back up either.
+    -- No verified export worked — let the client try its own integrations.
     TriggerClientEvent('lime_redzones:client:doRevive', src, coords, heading)
 end

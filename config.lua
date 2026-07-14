@@ -1,24 +1,15 @@
--- ═══════════════════════════════════════════════════════════════
---  lime_redzones — minimal config
---
---  Almost everything is managed IN-GAME via the admin tablet (/rz_admin)
---  and saved to your database. This file only holds a few things that
---  must exist before the script boots (keybinds) or are just lookup data.
---
---  Fresh installs start with ZERO redzones — create them in-game.
--- ═══════════════════════════════════════════════════════════════
+-- Almost everything is managed in-game via the admin tablet and saved to your
+-- database. This file only holds startup-time values and lookup data.
+-- Fresh installs start with zero redzones — create them in-game.
 
 Config = {}
 
--- Keybind to open the leaderboard. Keybinds must be registered at startup,
--- so this one lives here. Players can rebind it in GTA Settings > Key Bindings.
+-- Keybinds must be registered at startup. Players can rebind in GTA Settings > Key Bindings.
 Config.LeaderboardKeybindEnabled = true
 Config.LeaderboardKey            = 'F1'
 
--- OPTIONAL bootstrap admin(s) so you can get into the panel on a brand-new install.
--- After that, manage admins/ranks entirely in-game. ACE perms and framework
--- god/admin groups also grant access, so you can usually leave this empty.
---   Entry formats:  'license:xxxx'   or   { id = 'license:xxxx', rank = 'Admin' }
+-- Optional bootstrap admin(s) for a brand-new install (ACE/framework admins work too).
+-- Formats: 'license:xxxx'  or  { id = 'license:xxxx', rank = 'Admin' }
 Config.Admins = {
     -- 'license:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
 }
@@ -27,8 +18,7 @@ Config.Admins = {
 Config.LogKeepInMemory = 200          -- recent log entries kept per category for the panel
 Config.LogColor        = 10672181     -- Discord embed colour (decimal) — #A3E635
 
--- Weapon hash → readable label (used in kill feed / logs). Pure lookup data;
--- add entries here if you use custom weapons.
+-- Weapon hash -> readable label, used in kill feed / logs.
 Config.WeaponNames = {
     [453432689]  = 'Pistol',          [1593441988]  = 'Combat Pistol',
     [-1716589765]= 'Pistol .50',      [-1076751822] = 'SNS Pistol',

@@ -12,7 +12,6 @@ local function HexToRGB(hex)
     return tonumber('0x' .. hex:sub(1,2)) or 255, tonumber('0x' .. hex:sub(3,4)) or 0, tonumber('0x' .. hex:sub(5,6)) or 0
 end
 
--- Compute which enabled zone the player is physically inside RIGHT NOW.
 -- Resolves the zone at kill time, independent of the throttled state loop.
 local function ZoneAtPlayer()
     local pos = GetEntityCoords(PlayerPedId())
