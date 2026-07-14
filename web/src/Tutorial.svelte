@@ -1,9 +1,21 @@
 <script>
-  let { open = false, onstep, onclose, ondisable } = $props()
+  let { open = false, mode = 'admin', onstep, onclose, ondisable } = $props()
   let step = $state(0)
 
-  // Admin walkthrough — each step points at a panel tab and explains its options.
-  const steps = [
+  const playerSteps = [
+    { tab: 'hub', icon: '🏠', title: 'Your Hub',
+      body: 'Your home screen — see your current rank, kills, deaths, K/D, and every prize you\'ve won. Quick buttons jump you to the leaderboard, HUD, or zone colour.' },
+    { tab: 'rzleaderboard', icon: '🏆', title: 'Leaderboard',
+      body: 'Track your kills on the Redzone and Global boards. Search for any player, sort by kills or K/D, and your own row is highlighted so you can find yourself instantly. Win a weekly reset to claim a prize.' },
+    { tab: 'color', icon: '🎨', title: 'Zone Colour',
+      body: 'Set your own personal colour for the redzone dome — only you see it. Pick a hue, brightness and opacity.' },
+    { tab: 'hud', icon: '📊', title: 'HUD',
+      body: 'Choose a theme, pick where the HUD sits, and resize or drag your HUD, kill feed and "Eliminated" message anywhere you like.' },
+  ]
+
+  const adminSteps = [
+    { tab: 'dash', icon: '📊', title: 'Dashboard',
+      body: 'Your live overview — active vs total zones, players tracked, total kills and deaths, a per-zone kill breakdown with ON/OFF status, and your top players. Quick actions jump you anywhere.' },
     { tab: 'zones', icon: '📍', title: 'Zones',
       body: 'Create and manage redzones here. Each zone has a name, location, radius, dome colour, kill rewards, streak rewards, respawn points, and revive cost — all editable in-game. Toggle a zone on/off without deleting it.' },
     { tab: 'gangs', icon: '👥', title: 'Gangs',
@@ -19,6 +31,7 @@
     { tab: 'logs', icon: '📋', title: 'Logs',
       body: 'View admin, kill, and revive logs, send them to Discord webhooks, and auto-post leaderboard snapshots. Everything you set here saves to your database.' },
   ]
+  const steps = $derived(mode === 'admin' ? adminSteps : playerSteps)
   const last = $derived(step >= steps.length - 1)
 
   $effect(() => { if (open) onstep?.(steps[step].tab) })

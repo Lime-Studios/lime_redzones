@@ -52,7 +52,7 @@
   bind:this={el}
   style:left={effPos ? effPos.x + '%' : presetPos.x + '%'}
   style:top={effPos ? effPos.y + '%' : presetPos.y + '%'}
-  style:transform={effPos ? 'translate(-50%,-50%)' : presetPos.t}
+  style:transform={(effPos ? 'translate(-50%,-50%)' : presetPos.t) + ` scale(${scale})`}
   style:--hud-accent={accent}
   style:--hud-text={accentText}
   style:--hud-scale={scale}

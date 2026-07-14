@@ -1,6 +1,7 @@
 local Zones, zoneBlips = {}, {}
 local currentZoneId    = nil
 local kills, deaths, killStreak = 0, 0, 0
+local recentKills = {}  -- victim ped -> last kill time (dedup repeated damage events)
 local wasDead          = false
 local tabletOpen, tabletMode, hudMoveMode = false, nil, false
 local personalColor    = nil
@@ -12,7 +13,7 @@ local function HexToRGB(hex)
 end
 
 -- Compute which enabled zone the player is physically inside RIGHT NOW.
--- Used at kill time so we never miss a kill due to the throttled state loop.
+-- Resolves the zone at kill time, independent of the throttled state loop.
 local function ZoneAtPlayer()
     local pos = GetEntityCoords(PlayerPedId())
     for id, z in pairs(Zones) do
@@ -136,7 +137,7 @@ local function SetTablet(open, mode, tab, payload)
         killmsgPos = kvpJson('rz_km_pos'),
         killmsgScale = tonumber(GetResourceKvpFloat('rz_km_scale')) or 1.0,
         killmsgTheme = GetResourceKvpString('rz_km_theme') or 'inherit',
-        firstTime = GetResourceKvpString('rz_seen_tutorial') ~= 'yes',
+        firstTime = GetResourceKvpString('rz_seen_tutorial') ~= 'v2',
     })
     if not hudMoveMode then
         if open then
@@ -167,6 +168,14 @@ RegisterNetEvent('lime_redzones:client:logConfig', function(cfg)
 end)
 RegisterNetEvent('lime_redzones:client:prizeHistory', function(history)
     SendNUIMessage({ type = 'prizeHistory', history = history })
+end)
+RegisterNetEvent('lime_redzones:client:stats', function(stats)
+    SendNUIMessage({ type = 'stats', stats = stats })
+end)
+
+RegisterNetEvent('lime_redzones:client:myStats', function(k, d)
+    kills, deaths = tonumber(k) or 0, tonumber(d) or 0
+    UpdateHUD()
 end)
 
 RegisterNetEvent('lime_redzones:client:killFeed', function(entry)
@@ -228,7 +237,7 @@ end, false)
 RegisterCommand('rz_color', function() OpenPlayerTablet('color') end, false)
 RegisterCommand('rz_hud', function() SetHudMove(not hudMoveMode) end, false)
 
--- Register a callback that just forwards data to a server event.
+-- Forward NUI data straight to a server event.
 local function forward(name, event, arg)
     RegisterNUICallback(name, function(d, cb)
         TriggerServerEvent(event, arg and arg(d) or nil)
@@ -238,7 +247,7 @@ end
 
 RegisterNUICallback('closeTablet', function(_, cb) SetTablet(false) cb({}) end)
 RegisterNUICallback('tutorialSeen', function(_, cb)
-    SetResourceKvp('rz_seen_tutorial', 'yes')
+    SetResourceKvp('rz_seen_tutorial', 'v2')
     cb({})
 end)
 RegisterNUICallback('forceClose', function(_, cb)
@@ -284,6 +293,8 @@ forward('requestLogs', 'lime_redzones:server:requestLogs', function(d) return d.
 forward('requestLogConfig', 'lime_redzones:server:requestLogConfig')
 forward('postLeaderboardNow', 'lime_redzones:server:postLeaderboardNow', function(d) return d.board or 'redzone' end)
 forward('requestPrizeHistory', 'lime_redzones:server:requestPrizeHistory')
+forward('requestStats', 'lime_redzones:server:requestStats')
+forward('wipePrizeHistory', 'lime_redzones:server:wipePrizeHistory')
 forward('saveLogConfig', 'lime_redzones:server:saveLogConfig', function(d) return d end)
 RegisterNUICallback('saveKillMsgStyle', function(d, cb)
     if d.scale then SetResourceKvpFloat('rz_km_scale', tonumber(d.scale) or 1.0) end
@@ -467,7 +478,6 @@ CreateThread(function()
         if not nearest or nDist > (nearest.radius + renderDist) then
             if currentZoneId then
                 currentZoneId = nil
-                kills, deaths, killStreak = 0, 0, 0
                 UpdateHUD()
             end
             Wait(nDist > (nearest and nearest.radius or 0) + renderDist + 200.0 and 2000 or 1000)
@@ -490,17 +500,17 @@ CreateThread(function()
 
                 if inside and currentZoneId ~= nearestId then
                     currentZoneId = nearestId
-                    kills, deaths, killStreak = 0, 0, 0
+                    TriggerServerEvent('lime_redzones:server:requestMyStats')
                     UpdateHUD()
                 elseif not inside and currentZoneId then
                     currentZoneId = nil
-                    kills, deaths, killStreak = 0, 0, 0
                     UpdateHUD()
                 end
 
                 if currentZoneId and dead and not wasDead then
                     wasDead = true
                     deaths = deaths + 1
+                    killStreak = 0
                     UpdateHUD()
                     TriggerServerEvent('lime_redzones:server:reportDeath', currentZoneId)
 
@@ -514,34 +524,33 @@ CreateThread(function()
                                 local kPlayer = NetworkGetPlayerIndexFromPed(killer)
                                 local killerName = kPlayer ~= -1 and GetPlayerName(kPlayer) or 'Enemy'
                                 local killerId = kPlayer ~= -1 and GetPlayerServerId(kPlayer) or 0
+                                local camDur = math.max(1000, tonumber(Opts.killCamDuration) or 5000)
 
-                                SendNUIMessage({ type = 'killCam', display = true, killer = killerName, id = killerId })
+                                SendNUIMessage({ type = 'killCam', display = true, killer = killerName, id = killerId, duration = camDur })
 
-                                local function positionPOV()
+                                local function frameKiller()
                                     if not DoesEntityExist(killer) then return end
-                                    -- Killer's eye-line POV: just behind and slightly above the head,
-                                    -- aimed where the killer is facing (their point of view).
-                                    local headBone = GetPedBoneCoords(killer, 0x796E, 0.0, 0.0, 0.0) -- SKEL_Head
-                                    local fwd = GetEntityForwardVector(killer)
+                                    -- Third-person: sit behind and above the killer, framing their whole body.
+                                    local kc = GetEntityCoords(killer)
+                                    local heading = GetEntityHeading(killer)
+                                    local rad = math.rad(heading)
                                     local camPos = vector3(
-                                        headBone.x - fwd.x * 0.55,
-                                        headBone.y - fwd.y * 0.55,
-                                        headBone.z + 0.22
+                                        kc.x + math.sin(rad) * 2.6,
+                                        kc.y - math.cos(rad) * 2.6,
+                                        kc.z + 1.2
                                     )
                                     SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
-                                    local look = vector3(headBone.x + fwd.x * 8.0, headBone.y + fwd.y * 8.0, headBone.z + 0.05)
-                                    PointCamAtCoord(cam, look.x, look.y, look.z)
+                                    PointCamAtEntity(cam, killer, 0.0, 0.0, 0.0, true)
                                 end
 
-                                positionPOV()
+                                frameKiller()
                                 SetCamActive(cam, true)
                                 RenderScriptCams(true, false, 0, true, true)
 
                                 local t = GetGameTimer()
-                                local camDur = tonumber(Opts.killCamDuration) or 5000
                                 while killCamActive and (GetGameTimer() - t) < camDur and DoesEntityExist(killer) do
                                     Wait(0)
-                                    positionPOV()
+                                    frameKiller()
                                 end
 
                                 RenderScriptCams(false, false, 0, true, true)
@@ -583,6 +592,10 @@ CreateThread(function()
     local wasDeadGlobal = false
     while true do
         Wait(1500)
+        local _t = GetGameTimer()
+        for ped, ts in pairs(recentKills) do
+            if _t - ts > 5000 then recentKills[ped] = nil end
+        end
         -- Skip entirely if global leaderboard is disabled.
         if Opts.globalLbEnabled == false then
             wasDeadGlobal = false
@@ -629,6 +642,10 @@ AddEventHandler('gameEventTriggered', function(name, args)
         victim, tostring(IsPedAPlayer(victim)), tostring(isFatal), tostring(currentZoneId)))
 
     local function registerKill(reason)
+        -- Guard against the same death firing multiple damage events.
+        if recentKills[victim] and (GetGameTimer() - recentKills[victim]) < 3000 then return end
+        recentKills[victim] = GetGameTimer()
+
         local zoneNow = ZoneAtPlayer() or currentZoneId
         dbg('registerKill via ' .. reason .. ' | zoneNow=' .. tostring(zoneNow))
         if zoneNow then

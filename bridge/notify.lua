@@ -1,3 +1,4 @@
+local notifyWarned = false
 local limeFn = nil
 
 local function s(v)
@@ -59,7 +60,11 @@ function Notify(message, ntype, duration)
         return
     end
 
-    BeginTextCommandThefeedPost('STRING')
-    AddTextComponentSubstringPlayerName(message)
-    EndTextCommandThefeedPostTicker(false, true)
+    -- No external notification resource found. This script uses external
+    -- notifications only (no built-in/native notify). Warn once so the
+    -- server owner knows to install/start a supported notify resource.
+    if not notifyWarned then
+        notifyWarned = true
+        print('^3[lime_redzones] No supported notification resource detected (ox_lib, lime_notify, okokNotify, mythic_notify, qbx_core, qb-core, es_extended). Notifications will not be shown.^0')
+    end
 end

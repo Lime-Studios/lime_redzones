@@ -11,7 +11,7 @@
     display: false, mode: 'player', tab: 'rzleaderboard',
     zones: {}, gangs: {}, settings: {}, personalColor: null,
     lbData: { players: [], gangs: [], globalPlayers: [], totals: {} },
-    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logConfig: null, prizeHistory: [], firstTime: false, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
+    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
   })
   let killcam = $state({ display: false, killer: '', id: 0, theme: 'lime' })
   let kmRef
@@ -97,6 +97,7 @@
     if (d.type === 'logs') { tablet.logCategory = d.category ?? 'admin'; tablet.logs = d.entries ?? [] }
     if (d.type === 'logConfig') tablet.logConfig = d.config ?? null
     if (d.type === 'prizeHistory') tablet.prizeHistory = d.history ?? []
+    if (d.type === 'stats') tablet.stats = d.stats ?? {}
     if (d.type === 'lbData') {
       tablet.lbData = {
         players:       d.players       ?? [],

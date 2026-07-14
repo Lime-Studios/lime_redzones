@@ -4,7 +4,7 @@
   let { display = false, mode = 'player', tab = 'rzleaderboard',
         zones = {}, gangs = {}, settings = {}, personalColor = null,
         lbData = { players: [], gangs: [], globalPlayers: [], totals: {} },
-        placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logConfig = null, prizeHistory = [], firstTime = false,
+        placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logConfig = null, prizeHistory = [], firstTime = false, stats = {},
         hudTheme = 'lime', hudPreset = 'top', hudScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit',
         onclose } = $props()
 
@@ -13,6 +13,8 @@
 
   let activeTab = $state('rzleaderboard')
   let lbTab = $state('players')
+  let lbSearch = $state('')
+  let lbSort = $state('rank')  // rank | name | kills-high | kills-low | kd-high
   let editing = $state(null)
   let clock = $state('')
   let selTheme = $state('lime')
@@ -23,6 +25,7 @@
   let kmScaleVal = $state(1)
   let kmThemeVal = $state('inherit')
   let logCat = $state('admin')
+  let confirmWipe = $state(false)
   let manualTut = $state(false)
   let lc = $state(null)
 
@@ -32,7 +35,7 @@
   let tabInit = $state(false)
   $effect(() => {
     if (display && !tabInit) {
-      activeTab = tab || (mode === 'admin' ? 'zones' : 'rzleaderboard')
+      activeTab = tab || (mode === 'admin' ? 'dash' : 'hub')
       tabInit = true
     }
     if (!display) tabInit = false
@@ -43,9 +46,23 @@
     if (!display) styleInit = false
   })
   $effect(() => { if (!display) { editing = null; lbTab = 'players' } })
+  let idRequested = $state(false)
+  let hubLoaded = $state(false)
+  $effect(() => {
+    if (display && (effectiveTab === 'hub' || effectiveTab === 'dash' || effectiveTab === 'resets') && !hubLoaded) {
+      hubLoaded = true; post('requestPrizeHistory')
+      if (effectiveTab === 'dash') post('requestStats')
+    }
+    if (effectiveTab !== 'resets') confirmWipe = false
+    if (!display) hubLoaded = false
+  })
+  $effect(() => {
+    if (display && !idRequested && !myIds) { idRequested = true; post('getMyIdentifier') }
+    if (!display) idRequested = false
+  })
   let tutDismissed = $state(false)
   $effect(() => { if (!display) tutDismissed = false })
-  const showTutorial = $derived(display && mode === 'admin' && firstTime === true && !tutDismissed && !manualTut)
+  const showTutorial = $derived(display && firstTime === true && !tutDismissed && !manualTut)
 
 
   function tutStep(tab) { if (tab) activeTab = tab }
@@ -75,11 +92,36 @@
 
   const lbCols = $derived(lbData.totals?.cols ?? { kills: true, deaths: true, kd: true })
   const gangLbOn = $derived(lbData.totals?.gangLb !== false)
-  const lbList = $derived(
+  const lbRaw = $derived(
     effectiveTab === 'leaderboard' ? lbData.globalPlayers
     : lbTab === 'gangs' ? lbData.gangs
     : lbData.players
   )
+
+  // My identifier(s) so I can highlight + find my own row.
+  const myKey = $derived(myIds ? (myIds.identifier || myIds.license) : null)
+  const isMe = (item) => myKey && (item.id === myKey || item.id === myIds?.license || item.id === myIds?.identifier)
+
+  // The raw list is already rank-ordered (by kills). Tag each with its true rank first.
+  const lbRanked = $derived((lbRaw ?? []).map((it, idx) => ({ ...it, _rank: idx + 1 })))
+
+  const lbList = $derived.by(() => {
+    let list = lbRanked
+    const q = lbSearch.trim().toLowerCase()
+    if (q) list = list.filter(it => String(it.name ?? it.label ?? '').toLowerCase().includes(q))
+    const arr = [...list]
+    if (lbSort === 'name')       arr.sort((a, b) => String(a.name ?? a.label ?? '').localeCompare(String(b.name ?? b.label ?? '')))
+    else if (lbSort === 'kills-high') arr.sort((a, b) => (b.kills ?? 0) - (a.kills ?? 0))
+    else if (lbSort === 'kills-low')  arr.sort((a, b) => (a.kills ?? 0) - (b.kills ?? 0))
+    else if (lbSort === 'kd-high')    arr.sort((a, b) => ((b.kills??0)/Math.max(1,b.deaths??0)) - ((a.kills??0)/Math.max(1,a.deaths??0)))
+    // 'rank' keeps original order
+    return arr
+  })
+
+  // My current standing (for the HUB).
+  const myStanding = $derived(lbRanked.find(isMe) ?? null)
+  const myWins = $derived((prizeHistory ?? []).filter(w => myKey && (w.identifier === myKey || w.identifier === myIds?.license || w.identifier === myIds?.identifier)))
+  const fmtDate = (t) => { try { return new Date((t ?? 0) * 1000).toLocaleDateString() } catch { return '' } }
   const resetInfo = $derived(effectiveTab === 'leaderboard' ? lbData.totals?.globalReset : lbData.totals?.reset)
   const lbGrid = $derived('44px 1fr' + (lbCols?.kills ? ' 75px' : '') + (lbCols?.deaths ? ' 75px' : '') + (lbCols?.kd ? ' 65px' : ''))
 
@@ -201,12 +243,14 @@
   const PRESET_LIST = ['top', 'top-left', 'top-right', 'bottom', 'left', 'right']
 
   const playerNavAll = [
+    { id: 'hub',           label: 'Hub',            icon: 'M3 12l9-9 9 9M5 10v10h14V10' },
     { id: 'rzleaderboard', label: 'RZ Leaderboard', icon: 'M8 21h8M12 17v4M7 4h10v6a5 5 0 0 1-10 0V4z', need: 'leaderboardEnabled' },
     { id: 'leaderboard',   label: 'Leaderboard',    icon: 'M3 13h4v8H3zM10 5h4v16h-4zM17 9h4v12h-4z', need: 'globalLbEnabled' },
     { id: 'color',         label: 'Zone Colour',    icon: 'M12 2a10 10 0 1 0 10 10c0-1-1-2-2-2h-2a2 2 0 0 1-2-2c0-1 1-2 2-2h1a2 2 0 0 0 2-2c0-1-4-2-9-2z', need: 'personalColorEnabled' },
     { id: 'hud',           label: 'HUD',            icon: 'M3 5h18v12H3zM8 21h8' },
   ]
   const adminNavAll = [
+    { id: 'dash',     label: 'Dashboard',    icon: 'M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z' },
     { id: 'zones',    label: 'Zones',        icon: 'M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z', perm: 'zones' },
     { id: 'gangs',    label: 'Gangs',        icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', perm: 'gangs' },
     { id: 'resets',   label: 'Leaderboards', icon: 'M3 12a9 9 0 1 0 9-9M3 12l3-3M3 12l3 3', perm: 'leaderboards' },
@@ -248,12 +292,12 @@
     </span>
     <span class="sb-right">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M2 9c5.5-5.5 14.5-5.5 20 0M5 12.5c3.9-3.9 10.1-3.9 14 0M8.5 16c2-2 5-2 7 0M12 19.5h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      {#if mode === 'admin'}<button class="sb-help" onclick={() => manualTut = true} aria-label="Show tutorial" title="Show tutorial"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.5v.2M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>{/if}
+      <button class="sb-help" onclick={() => manualTut = true} aria-label="Show tutorial" title="Show tutorial"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.5v.2M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
       <button class="sb-close" onclick={onclose} aria-label="Close"><svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
     </span>
   </div>
 
-  <Tutorial open={showTutorial || manualTut} onstep={tutStep} onclose={tutClose} ondisable={tutDisable} />
+  <Tutorial open={showTutorial || manualTut} mode={mode} onstep={tutStep} onclose={tutClose} ondisable={tutDisable} />
 
   <div class="tbody">
     <div class="nav">
@@ -272,7 +316,62 @@
     </div>
 
     <div class="content">
-      {#if effectiveTab === 'rzleaderboard' || effectiveTab === 'leaderboard'}
+      {#if effectiveTab === 'hub'}
+        <div class="page-head"><h1>Hub</h1></div>
+        <p class="sub">Your redzone profile at a glance.</p>
+
+        <div class="hub-grid">
+          <div class="hub-card big">
+            <span class="hub-label">Your Rank</span>
+            <span class="hub-big">{myStanding ? '#' + myStanding._rank : '—'}</span>
+            <span class="hub-sub">{myStanding ? 'Redzone leaderboard' : 'No kills yet — get in a zone!'}</span>
+          </div>
+          <div class="hub-card">
+            <span class="hub-label">Kills</span>
+            <span class="hub-num">{myStanding?.kills ?? 0}</span>
+          </div>
+          <div class="hub-card">
+            <span class="hub-label">Deaths</span>
+            <span class="hub-num">{myStanding?.deaths ?? 0}</span>
+          </div>
+          <div class="hub-card">
+            <span class="hub-label">K/D</span>
+            <span class="hub-num">{kd(myStanding?.kills ?? 0, myStanding?.deaths ?? 0)}</span>
+          </div>
+          <div class="hub-card">
+            <span class="hub-label">Wins</span>
+            <span class="hub-num">{myWins.length}</span>
+          </div>
+        </div>
+
+        <div class="block">
+          <div class="frow between">
+            <b class="blk-title">🏆 Your Past Prizes</b>
+            <button class="btn" onclick={() => post('requestPrizeHistory')}>Refresh</button>
+          </div>
+          {#if myWins.length === 0}
+            <p class="hint">You haven't won a weekly reset yet. Top the leaderboard to claim a prize!</p>
+          {:else}
+            {#each myWins.slice(0, 10) as w (w.time + (w.board ?? ''))}
+              <div class="frow inset">
+                <span class="win-board" class:global={w.board === 'global'}>{w.board === 'global' ? 'GLOBAL' : 'RZ'}</span>
+                <span class="grow">{w.kills} kills · <span class="dim">{fmtDate(w.time)}</span></span>
+                <span class="win-prize">{w.prize?.name === 'money' ? '$' + w.prize.amount : (w.prize?.amount + '× ' + w.prize?.name)}</span>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <div class="block">
+          <b class="blk-title">⚡ Quick Actions</b>
+          <div class="hub-actions">
+            <button class="btn go" onclick={() => activeTab = 'rzleaderboard'}>View Leaderboard</button>
+            <button class="btn" onclick={() => activeTab = 'hud'}>Customise HUD</button>
+            <button class="btn" onclick={() => activeTab = 'color'}>Zone Colour</button>
+          </div>
+        </div>
+
+      {:else if effectiveTab === 'rzleaderboard' || effectiveTab === 'leaderboard'}
         <div class="page-head">
           <h1>{effectiveTab === 'leaderboard' ? 'Global Leaderboard' : 'Redzone Leaderboard'}</h1>
           <div class="stat-pills">
@@ -289,6 +388,22 @@
         {#if resetInfo?.enabled}
           <div class="reset-line">Resets {resetInfo.label}{#if resetInfo.prize} · 🏆 {resetInfo.prize.name === 'money' ? '$' + resetInfo.prize.amount : resetInfo.prize.amount + 'x ' + resetInfo.prize.name}{/if}</div>
         {/if}
+
+        <div class="lb-tools">
+          <div class="lb-search">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <input placeholder={lbTab === 'gangs' ? 'Search gangs…' : 'Search players…'} bind:value={lbSearch} />
+            {#if lbSearch}<button class="lb-clear" onclick={() => lbSearch = ''} aria-label="Clear">✕</button>{/if}
+          </div>
+          <select class="lb-sort" bind:value={lbSort}>
+            <option value="rank">Rank</option>
+            <option value="kills-high">Kills: High → Low</option>
+            <option value="kills-low">Kills: Low → High</option>
+            <option value="kd-high">Best K/D</option>
+            <option value="name">Name A → Z</option>
+          </select>
+        </div>
+
         <div class="lb">
           <div class="lb-head" style:grid-template-columns={lbGrid}>
             <span>#</span><span>{lbTab === 'gangs' ? 'GANG' : 'PLAYER'}</span>
@@ -296,12 +411,13 @@
             {#if lbCols.deaths}<span class="c">DEATHS</span>{/if}
             {#if lbCols.kd}<span class="c">K/D</span>{/if}
           </div>
-          {#if lbList.length === 0}<div class="empty">No data yet.</div>{/if}
+          {#if lbList.length === 0}<div class="empty">{lbSearch ? 'No matches.' : 'No data yet.'}</div>{/if}
           {#each lbList as item, i (item.id ?? item.label ?? i)}
             {@const name = lbTab === 'gangs' ? item.label : item.name}
-            <div class="lb-row" class:first={i === 0} style:grid-template-columns={lbGrid}>
-              <span class="rank" class:r1={i===0} class:r2={i===1} class:r3={i===2}>{i + 1}</span>
-              <span class="who"><span class="av">{initial(name)}</span>{name ?? 'Unknown'}</span>
+            {@const rank = item._rank ?? (i + 1)}
+            <div class="lb-row" class:first={rank === 1} class:me={lbTab !== 'gangs' && isMe(item)} style:grid-template-columns={lbGrid}>
+              <span class="rank" class:r1={rank===1} class:r2={rank===2} class:r3={rank===3}>{rank}</span>
+              <span class="who"><span class="av">{initial(name)}</span>{name ?? 'Unknown'}{#if lbTab !== 'gangs' && isMe(item)}<span class="you-tag">YOU</span>{/if}</span>
               {#if lbCols.kills}<span class="c">{item.kills ?? 0}</span>{/if}
               {#if lbCols.deaths}<span class="c">{item.deaths ?? 0}</span>{/if}
               {#if lbCols.kd}<span class="c bold">{kd(item.kills ?? 0, item.deaths ?? 0)}</span>{/if}
@@ -427,6 +543,67 @@
           <p class="hint">A preview appears — drag it where you want, then click Done.</p>
         </div>
         {/if}
+      {/if}
+
+      {#if effectiveTab === 'dash'}
+        <div class="page-head"><h1>Dashboard</h1></div>
+        <p class="sub">Live overview of your redzones and activity.</p>
+
+        <div class="hub-grid">
+          <div class="hub-card big">
+            <span class="hub-label">Active Zones</span>
+            <span class="hub-big">{stats.activeZones ?? 0}<span class="hub-of">/ {stats.totalZones ?? 0}</span></span>
+            <span class="hub-sub">{stats.totalZones ? 'redzones configured' : 'No zones yet — create one'}</span>
+          </div>
+          <div class="hub-card"><span class="hub-label">Players Tracked</span><span class="hub-num">{stats.playersTracked ?? 0}</span></div>
+          <div class="hub-card"><span class="hub-label">Total Kills</span><span class="hub-num">{stats.totalKills ?? 0}</span></div>
+          <div class="hub-card"><span class="hub-label">Total Deaths</span><span class="hub-num">{stats.totalDeaths ?? 0}</span></div>
+          <div class="hub-card"><span class="hub-label">Gangs</span><span class="hub-num">{stats.gangs ?? 0}</span></div>
+          <div class="hub-card"><span class="hub-label">Admins</span><span class="hub-num">{stats.admins ?? 0}</span></div>
+        </div>
+
+        <div class="block">
+          <b class="blk-title">📍 Zones</b>
+          {#if (stats.zoneList ?? []).length === 0}
+            <p class="hint">No zones created yet. Head to the Zones tab to make your first redzone.</p>
+          {:else}
+            <div class="lb-head" style="grid-template-columns: 1fr auto auto; padding: 4px 10px;">
+              <span>ZONE</span><span class="c">KILLS</span><span class="c">STATUS</span>
+            </div>
+            {#each stats.zoneList as z (z.id)}
+              <div class="frow inset" style="display:grid; grid-template-columns: 1fr auto auto; gap:10px; align-items:center;">
+                <span class="grow"><b>{z.name}</b></span>
+                <span class="c">{z.kills ?? 0}</span>
+                <span class="zstat" class:on={z.enabled}>{z.enabled ? 'ON' : 'OFF'}</span>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <div class="block">
+          <b class="blk-title">🏆 Top Players</b>
+          {#if (stats.topPlayers ?? []).length === 0}
+            <p class="hint">No kills recorded yet.</p>
+          {:else}
+            {#each stats.topPlayers.slice(0, 5) as p, i (p.name + i)}
+              <div class="frow inset">
+                <span class="rank" class:r1={i===0} class:r2={i===1} class:r3={i===2}>{i + 1}</span>
+                <span class="grow"><b>{p.name}</b></span>
+                <span class="win-prize">{p.kills} kills</span>
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <div class="block">
+          <b class="blk-title">⚡ Quick Actions</b>
+          <div class="hub-actions">
+            <button class="btn go" onclick={() => activeTab = 'zones'}>Manage Zones</button>
+            <button class="btn" onclick={() => activeTab = 'resets'}>Leaderboards</button>
+            <button class="btn" onclick={() => activeTab = 'logs'}>View Logs</button>
+            <button class="btn" onclick={() => post('requestStats')}>Refresh</button>
+          </div>
+        </div>
 
       {:else if effectiveTab === 'zones'}
         <div class="page-head"><h1>Zones</h1><button class="btn go" onclick={() => startEdit(null)}>+ Create Redzone</button></div>
@@ -479,6 +656,29 @@
           </div>
         {/each}
         <p class="hint">Prize goes to #1 by kills. Offline winners receive it on next join.</p>
+
+        <div class="block">
+          <div class="frow between">
+            <b class="blk-title">🏆 Past Winners</b>
+            <button class="btn" onclick={() => post('requestPrizeHistory')}>Refresh</button>
+          </div>
+          {#if (prizeHistory ?? []).length === 0}
+            <p class="hint">No recorded winners yet.</p>
+          {:else}
+            {#each (prizeHistory ?? []).slice(0, 8) as w (w.time + (w.name ?? ''))}
+              <div class="frow inset">
+                <span class="win-board" class:global={w.board === 'global'}>{w.board === 'global' ? 'GLOBAL' : 'RZ'}</span>
+                <span class="grow"><b>{w.name}</b> · {w.kills} kills</span>
+                <span class="win-prize">{w.prize?.name === 'money' ? '$' + w.prize.amount : (w.prize?.amount + '× ' + w.prize?.name)}</span>
+              </div>
+            {/each}
+            {#if (prizeHistory ?? []).length > 8}<p class="hint">+ {(prizeHistory.length - 8)} more…</p>{/if}
+            <button class="btn red" onclick={() => { if (confirmWipe) { post('wipePrizeHistory'); confirmWipe = false } else confirmWipe = true }}>
+              {confirmWipe ? 'Click again to confirm wipe' : '🗑 Wipe Past Winners'}
+            </button>
+            {#if confirmWipe}<button class="btn" onclick={() => confirmWipe = false}>Cancel</button>{/if}
+          {/if}
+        </div>
 
       {:else if effectiveTab === 'killfeed'}
         <div class="page-head"><h1>Kill Feed &amp; Cam</h1></div>
@@ -787,6 +987,7 @@
   .f > span { font-size: 10px; font-weight: 800; color: rgba(255,255,255,0.55); display: flex; justify-content: space-between; gap: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
   .f em { font-style: normal; color: var(--accent); text-transform: none; }
   input:not(.track), select { background: #1d2026; border: 1px solid rgba(255,255,255,0.13); border-radius: 10px; padding: 8px 11px; color: #ffffff !important; font-size: 12.5px; font-weight: 600; font-family: inherit; width: 100%; min-width: 50px; outline: none; caret-color: var(--accent); }
+  option { background: #1d2026; color: #ffffff; }
   input::placeholder { color: rgba(255,255,255,0.35); }
   select option { background: #1d2026; color: #ffffff; }
   input:focus, select:focus { border-color: var(--accent-border); }
@@ -852,4 +1053,29 @@
   .win-board { font-size: 9px; font-weight: 900; letter-spacing: 0.08em; padding: 2px 7px; border-radius: 5px; background: var(--accent-soft); color: var(--accent); }
   .win-board.global { background: rgba(34,211,238,0.14); color: #22D3EE; }
   .win-prize { font-size: 11px; font-weight: 800; color: var(--accent); white-space: nowrap; }
+
+  /* Hub / Dashboard */
+  .hub-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 6px; }
+  .hub-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
+  .hub-card.big { grid-column: span 3; background: linear-gradient(135deg, var(--accent-soft), rgba(255,255,255,0.02)); border-color: var(--accent-soft); }
+  .hub-label { font-size: 10px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3); }
+  .hub-num { font-size: 22px; font-weight: 900; color: #fff; }
+  .hub-big { font-size: 38px; font-weight: 900; color: var(--accent); line-height: 1; }
+  .hub-of { font-size: 18px; color: var(--text-3); font-weight: 700; margin-left: 4px; }
+  .hub-sub { font-size: 11px; color: var(--text-2); }
+  .hub-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .dim, .zstat { font-size: 10px; color: var(--text-3); }
+  .zstat { font-weight: 800; padding: 2px 8px; border-radius: 5px; background: rgba(255,255,255,0.06); }
+  .zstat.on { background: var(--accent-soft); color: var(--accent); }
+
+  /* Leaderboard tools */
+  .lb-tools { display: flex; gap: 8px; margin-bottom: 8px; align-items: stretch; }
+  .lb-search { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 7px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 9px; padding: 0 10px; color: var(--text-3); }
+  .lb-search svg { flex-shrink: 0; }
+  .lb-search input { flex: 1; background: none; border: none; outline: none; color: #fff; font-family: inherit; font-size: 12px; padding: 8px 0; }
+  .lb-clear { background: none; border: none; color: var(--text-3); cursor: pointer; font-size: 12px; }
+  .lb-sort { flex: 0 0 auto; width: auto !important; min-width: 130px; background: #1d2026; border: 1px solid rgba(255,255,255,0.13); border-radius: 9px; color: #fff; font-family: inherit; font-size: 11.5px; padding: 0 10px; cursor: pointer; appearance: none; }
+  .lb-sort option { background: #1d2026; color: #fff; }
+  .lb-row.me { background: var(--accent-soft); border-radius: 8px; box-shadow: inset 0 0 0 1px var(--accent); }
+  .you-tag { font-size: 8.5px; font-weight: 900; letter-spacing: 0.06em; background: var(--accent); color: var(--accent-text); padding: 1px 5px; border-radius: 4px; margin-left: 7px; }
 </style>

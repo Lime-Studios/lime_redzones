@@ -5,6 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>lime_redzones</title>
   <style>
+    @font-face {
+      font-family: 'Plus Jakarta Sans';
+      src: url('./fonts/PlusJakartaSans-Variable.woff2') format('woff2-variations'),
+           url('./fonts/PlusJakartaSans-Variable.woff2') format('woff2');
+      font-weight: 200 800;
+      font-style: normal;
+      font-display: swap;
+    }
     :root {
       --bg:        #0f0f11;
       --surface:   #161618;
@@ -24,7 +32,7 @@
       --danger-soft: rgba(248,113,113,0.1);
       --radius:    14px;
       --radius-sm: 9px;
-      --font: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+      --font: 'Plus Jakarta Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
     }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {

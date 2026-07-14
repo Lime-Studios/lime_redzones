@@ -231,8 +231,11 @@ end
 
 local function GetIdentifier(src)
     local p = GetPlayer(src)
-    if p and (FWName == 'qbx' or FWName == 'qb') then return p.PlayerData.citizenid end
-    return GetPlayerIdentifierByType(src, 'license') or tostring(src)
+    if p and (FWName == 'qbx' or FWName == 'qb') then
+        local cid = p.PlayerData and p.PlayerData.citizenid
+        if cid then return cid end
+    end
+    return GetPlayerIdentifierByType(src, 'license') or ('src:' .. tostring(src))
 end
 
 local function FrameworkIsAdmin(src)
@@ -350,6 +353,18 @@ local function BroadcastZones(target)
 end
 
 local streaks, lastKill, lastDeath, lastGlobal, lastRevive = {}, {}, {}, {}, {}
+local lastRequest = {}
+
+-- Lightweight spam guard for read-only request events.
+-- Keyed per event so different requests fired together don't block each other.
+local function reqOk(src, gap, key)
+    key = key or 'default'
+    lastRequest[src] = lastRequest[src] or {}
+    local now = os.clock()
+    if lastRequest[src][key] and (now - lastRequest[src][key]) < (gap or 0.5) then return false end
+    lastRequest[src][key] = now
+    return true
+end
 
 local function cap(t, n) local r = {} for i = 1, math.min(n, #t) do r[i] = t[i] end return r end
 
@@ -410,6 +425,7 @@ end
 
 local function EnsureP(store, src)
     local id = GetIdentifier(src)
+    if not id then return { name = GetPName(src), kills = 0, deaths = 0 } end
     store[id] = store[id] or { name = GetPName(src), kills = 0, deaths = 0 }
     store[id].name = GetPName(src)
     return store[id]
@@ -432,33 +448,46 @@ end
 local function DoReset(which)
     local cfg = Data.settings[which]
     local store = which == 'reset' and Data.lb.players or Data.globalLb.players
+    local boardName = which == 'reset' and 'Redzone' or 'Global'
+    local logCat = which == 'reset' and 'leaderboardRz' or 'leaderboardGlobal'
 
-    if cfg.prizeAmount and cfg.prizeAmount > 0 then
-        local top, topKills = nil, -1
-        for id, d in pairs(store) do
-            if d.kills > topKills then top, topKills = id, d.kills end
-        end
-        if top and topKills > 0 then
-            GrantPrizeOrQueue(top, cfg.prizeName or 'money', cfg.prizeAmount)
-            Data.prizeHistory = Data.prizeHistory or {}
-            table.insert(Data.prizeHistory, 1, {
-                board = which == 'reset' and 'redzone' or 'global',
-                name = (store[top] and store[top].name) or 'Unknown',
-                identifier = top,
-                prize = { name = cfg.prizeName or 'money', amount = cfg.prizeAmount },
-                kills = topKills,
-                time = os.time(),
-            })
-            -- Keep the last 50 winners.
-            while #Data.prizeHistory > 50 do table.remove(Data.prizeHistory) end
-            if Log then
-                Log(which == 'reset' and 'leaderboardRz' or 'leaderboardGlobal', '🏆 Leaderboard Winner',
-                    ('**%s** won the %s leaderboard with **%d kills**'):format(
-                        (store[top] and store[top].name) or 'Unknown',
-                        which == 'reset' and 'Redzone' or 'Global', topKills),
-                    { { name = 'Prize', value = (cfg.prizeName == 'money' and ('$' .. cfg.prizeAmount) or (cfg.prizeAmount .. 'x ' .. cfg.prizeName)), inline = true } })
+    -- Find the top player by kills.
+    local top, topKills = nil, -1
+    for id, d in pairs(store) do
+        if d.kills > topKills then top, topKills = id, d.kills end
+    end
+    local winnerName = (top and store[top] and store[top].name) or nil
+    local hasWinner = top and topKills > 0
+
+    -- Award the prize (if configured) and record the winner in history.
+    if hasWinner and cfg.prizeAmount and cfg.prizeAmount > 0 then
+        GrantPrizeOrQueue(top, cfg.prizeName or 'money', cfg.prizeAmount)
+        Data.prizeHistory = Data.prizeHistory or {}
+        table.insert(Data.prizeHistory, 1, {
+            board = which == 'reset' and 'redzone' or 'global',
+            name = winnerName or 'Unknown',
+            identifier = top,
+            prize = { name = cfg.prizeName or 'money', amount = cfg.prizeAmount },
+            kills = topKills,
+            time = os.time(),
+        })
+        while #Data.prizeHistory > 50 do table.remove(Data.prizeHistory) end
+    end
+
+    -- Always log the reset, naming the winner (and prize if any).
+    if Log then
+        local desc, fields
+        if hasWinner then
+            desc = ('🏆 **%s** won the weekly %s leaderboard with **%d kills**!'):format(winnerName or 'Unknown', boardName, topKills)
+            fields = {}
+            if cfg.prizeAmount and cfg.prizeAmount > 0 then
+                fields[#fields+1] = { name = 'Prize', value = (cfg.prizeName == 'money' and ('$' .. cfg.prizeAmount) or (cfg.prizeAmount .. 'x ' .. cfg.prizeName)), inline = true }
             end
+            fields[#fields+1] = { name = 'Kills', value = tostring(topKills), inline = true }
+        else
+            desc = ('The weekly %s leaderboard reset — no kills were recorded this week.'):format(boardName)
         end
+        Log(logCat, ('🔄 %s Leaderboard Reset'):format(boardName), desc, fields)
     end
 
     if which == 'reset' then Data.lb = { players = {}, gangs = {} }
@@ -466,7 +495,7 @@ local function DoReset(which)
     cfg.lastReset = os.time()
     SaveData()
     PushLeaderboard(-1)
-    print(('[lime_redzones] %s leaderboard reset complete.'):format(which == 'reset' and 'Zone' or 'Global'))
+    print(('[lime_redzones] %s leaderboard reset complete.'):format(boardName))
 end
 
 CreateThread(function()
@@ -552,6 +581,8 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
 
     local lb = EnsureP(Data.lb.players, src)
     lb.kills = lb.kills + 1
+    -- Per-zone kill tally (for the admin dashboard).
+    zone.kills = (zone.kills or 0) + 1
     -- Redzone kills also count toward the server-wide Global leaderboard.
     if Data.settings.options.globalLbEnabled ~= false then
         local glb = EnsureP(Data.globalLb.players, src)
@@ -595,7 +626,7 @@ RegisterNetEvent('lime_redzones:server:reportDeath', function(zoneId)
     local src = source
     if zoneId == nil then return end
     zoneId = tostring(zoneId)
-    local zone = Data.zones[tostring(zoneId)]
+    local zone = Data.zones[zoneId]
     if not zone then return end
 
     local now = os.clock()
@@ -699,6 +730,7 @@ RegisterNetEvent('lime_redzones:server:requestLeaderboard', function()
     PushLeaderboard(source)
 end)
 RegisterNetEvent('lime_redzones:server:requestZones', function()
+    if not reqOk(source, 1.0, 'zones') then return end
     BroadcastZones(source)
     TriggerClientEvent('lime_redzones:client:syncOptions', source, Data.settings.options)
 end)
@@ -712,7 +744,7 @@ end)
 
 AddEventHandler('playerDropped', function()
     local src = source
-    streaks[src], lastKill[src], lastDeath[src], lastGlobal[src], lastRevive[src] = nil, nil, nil, nil, nil
+    streaks[src], lastKill[src], lastDeath[src], lastGlobal[src], lastRevive[src], lastRequest[src] = nil, nil, nil, nil, nil, nil
 end)
 
 local function SendAdminData(src)
@@ -1085,7 +1117,62 @@ RegisterNetEvent('lime_redzones:server:postLeaderboardNow', function(board)
 end)
 
 -- Send prize history to a requesting player (public — anyone can see past winners).
+RegisterNetEvent('lime_redzones:server:requestMyStats', function()
+    local src = source
+    if not reqOk(src, 0.5, 'mystats') then return end
+    local id = GetIdentifier(src)
+    local p = Data.lb.players[id]
+    TriggerClientEvent('lime_redzones:client:myStats', src, p and p.kills or 0, p and p.deaths or 0)
+end)
+
+RegisterNetEvent('lime_redzones:server:requestStats', function()
+    local src = source
+    if not IsAdmin(src) then return end
+    if not reqOk(src, 1.0, 'stats') then return end
+
+    local totalZones, activeZones = 0, 0
+    local zoneList = {}
+    for id, z in pairs(Data.zones) do
+        totalZones = totalZones + 1
+        if z.enabled then activeZones = activeZones + 1 end
+        zoneList[#zoneList+1] = { id = id, name = z.name or id, enabled = z.enabled and true or false, kills = z.kills or 0 }
+    end
+    table.sort(zoneList, function(a, b) return (a.kills or 0) > (b.kills or 0) end)
+
+    local playersTracked, totalKills, totalDeaths = 0, 0, 0
+    local top = {}
+    for _, p in pairs(Data.lb.players) do
+        playersTracked = playersTracked + 1
+        totalKills = totalKills + (p.kills or 0)
+        totalDeaths = totalDeaths + (p.deaths or 0)
+        top[#top+1] = { name = p.name, kills = p.kills or 0, deaths = p.deaths or 0 }
+    end
+    table.sort(top, function(a, b) return a.kills > b.kills end)
+    local topPlayers = {}
+    for i = 1, math.min(5, #top) do topPlayers[i] = top[i] end
+
+    local gangs = 0
+    for _ in pairs(Data.lb.gangs or {}) do gangs = gangs + 1 end
+
+    TriggerClientEvent('lime_redzones:client:stats', src, {
+        totalZones = totalZones, activeZones = activeZones, zoneList = zoneList,
+        playersTracked = playersTracked, totalKills = totalKills, totalDeaths = totalDeaths,
+        topPlayers = topPlayers, gangs = gangs, admins = #(Data.settings.admins or {}),
+    })
+end)
+
+RegisterNetEvent('lime_redzones:server:wipePrizeHistory', function()
+    local src = source
+    if not HasPerm(src, 'leaderboards') then return end
+    Data.prizeHistory = {}
+    SaveData()
+    TriggerClientEvent('lime_redzones:client:prizeHistory', src, {})
+    NotifySv(src, 'Past winners wiped.', 'success')
+    if Log then Log('admin', 'Past Winners Wiped', ('**%s** wiped the past winners list'):format(GetPName(src))) end
+end)
+
 RegisterNetEvent('lime_redzones:server:requestPrizeHistory', function()
     local src = source
+    if not reqOk(src, 1.0, 'prizehistory') then return end
     TriggerClientEvent('lime_redzones:client:prizeHistory', src, Data.prizeHistory or {})
 end)

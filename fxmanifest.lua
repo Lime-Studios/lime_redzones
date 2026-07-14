@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'lime'
 description 'lime_redzones — in-game redzone creator'
-version '1.0.2'
+version '1.0.3'
 
 ui_page 'web/index.html'
 
@@ -12,6 +12,7 @@ files {
     'web/index.html',
     'web/bundle.js',
     'web/bundle.css',
+    'web/fonts/PlusJakartaSans-Variable.woff2',
 }
 
 shared_script 'config.lua'

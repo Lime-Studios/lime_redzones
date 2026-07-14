@@ -14,7 +14,7 @@
   <div class="kc-bottom">
     <span class="kc-tag">KILLED BY</span>
     <span class="kc-name">{killer || 'Enemy'}{#if id} <em>#{id}</em>{/if}</span>
-    <span class="kc-pov">their point of view</span>
+    <span class="kc-pov">your eliminator</span>
   </div>
 </div>
 {/if}
