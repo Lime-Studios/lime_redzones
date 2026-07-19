@@ -17,7 +17,7 @@
     { tab: 'dash', icon: '📊', title: 'Dashboard',
       body: 'Your live overview — active vs total zones, players tracked, total kills and deaths, a per-zone kill breakdown with ON/OFF status, and your top players. Quick actions jump you anywhere.' },
     { tab: 'zones', icon: '📍', title: 'Zones',
-      body: 'Create and manage redzones here. Each zone has a name, location, radius, dome colour, kill rewards, streak rewards, respawn points, and revive cost — all editable in-game. Toggle a zone on/off without deleting it.' },
+      body: 'Two kinds of zone live here. Redzones are PvP areas with kill rewards, streaks, respawn points and paid revive. Safe zones block all damage, holster weapons and let players walk through each other — perfect for spawns and hospitals. Where they overlap, the safe zone always wins.' },
     { tab: 'gangs', icon: '👥', title: 'Gangs',
       body: 'Register gangs for the gang leaderboard. Framework gangs are auto-detected; add custom ones here for standalone setups.' },
     { tab: 'resets', icon: '🏆', title: 'Leaderboards',

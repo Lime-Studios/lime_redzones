@@ -1,5 +1,8 @@
 # lime_redzones
 
+In-game redzone (PvP) **and** safe zone (greenzone) creator. Both zone types
+live in one resource, one database, one admin panel.
+
 An in-game redzone creator for FiveM with a tablet-style admin panel, live leaderboards, kill feed, kill cam, streak rewards, and full per-feature toggles. No config editing required — everything is managed in-game and stored in MySQL.
 
 ## Features

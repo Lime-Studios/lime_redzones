@@ -4,6 +4,8 @@
   import TabletApp from './TabletApp.svelte'
   import KillFeed from './KillFeed.svelte'
   import KillCam from './KillCam.svelte'
+  import SafeZoneHUD from './SafeZoneHUD.svelte'
+  import PlacementBar from './PlacementBar.svelte'
   import KillMessage from './KillMessage.svelte'
 
   let hud = $state({ display: false, zoneName: 'Redzone', kills: 0, deaths: 0, streak: 0, nextReward: null, moveMode: false, pos: null, theme: 'lime', preset: 'top', scale: 1 })
@@ -11,9 +13,11 @@
     display: false, mode: 'player', tab: 'rzleaderboard',
     zones: {}, gangs: {}, settings: {}, personalColor: null,
     lbData: { players: [], gangs: [], globalPlayers: [], totals: {} },
-    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
+    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
   })
   let killcam = $state({ display: false, killer: '', id: 0, theme: 'lime' })
+  let safezone = $state({ display: false, name: '', speedLimit: 0 })
+  let placementBar = $state({ display: false, mode: 'poly', count: 0, max: 24, minZ: 0, maxZ: 0, speed: 1 })
   let kmRef
   let kfPos = $state(null)
   let kfMove = $state(false)
@@ -94,10 +98,12 @@
       setTimeout(() => { tablet.placementDraft = null }, 500)
     }
     if (d.type === 'myIdentifier') tablet.myIds = { license: d.license, identifier: d.identifier }
-    if (d.type === 'logs') { tablet.logCategory = d.category ?? 'admin'; tablet.logs = d.entries ?? [] }
+    if (d.type === 'logs') { tablet.logCategory = d.category ?? 'admin'; tablet.logs = d.entries ?? []; tablet.logTotal = Number(d.total) || 0 }
     if (d.type === 'logConfig') tablet.logConfig = d.config ?? null
     if (d.type === 'prizeHistory') tablet.prizeHistory = d.history ?? []
     if (d.type === 'stats') tablet.stats = d.stats ?? {}
+    if (d.type === 'safezone') { safezone.display = !!d.display; if (d.name !== undefined) safezone.name = d.name; safezone.speedLimit = Number(d.speedLimit) || 0 }
+    if (d.type === 'placementBar') { placementBar = { display: !!d.display, mode: d.mode ?? 'poly', count: Number(d.count) || 0, max: Number(d.max) || 24, minZ: Number(d.minZ) || 0, maxZ: Number(d.maxZ) || 0, speed: Number(d.speed) || 1 } }
     if (d.type === 'lbData') {
       tablet.lbData = {
         players:       d.players       ?? [],
@@ -126,6 +132,8 @@
 </script>
 
 <RedzoneHUD {...hud} />
+<SafeZoneHUD display={safezone.display} name={safezone.name} speedLimit={safezone.speedLimit} />
+<PlacementBar {...placementBar} />
 {#if options.killFeedEnabled !== false}
   <KillFeed bind:this={kfRef} pos={kfPos} moveMode={kfMove} scale={kfScale} theme={kfTheme} />
 {/if}

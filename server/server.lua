@@ -33,13 +33,14 @@ local Data = {
         logs = {
             enabled = true,
             categories = { admin = true, kills = false, revives = true },
+            retentionDays = 14,
             webhooks = { admin = '', kills = '', revives = '', leaderboardRz = '', leaderboardGlobal = '' },
             leaderboardPost = { enabled = false, board = 'redzone', interval = 30, top = 10 },
         },
         admins      = {},
         ranks       = {
-            { name = 'Moderator', perms = { zones = false, gangs = false, leaderboards = true, options = false, killfeed = false } },
-            { name = 'Admin',     perms = { zones = true,  gangs = true,  leaderboards = true, options = true,  killfeed = true } },
+            { name = 'Moderator', perms = { zones = false, gangs = false, leaderboards = true, options = false, killfeed = false, logs = false } },
+            { name = 'Admin',     perms = { zones = true,  gangs = true,  leaderboards = true, options = true,  killfeed = true,  logs = true } },
         },
     },
 }
@@ -136,16 +137,42 @@ local function LoadData(done)
                     MergeConfigAdmins()
                     done()
                 else
+                    -- Fresh lime_redzones table. Servers that ran the brief
+                    -- lime_zones-named build have their data in that table —
+                    -- carry it over instead of starting empty. Existence is
+                    -- checked first so a clean install doesn't produce a
+                    -- "table doesn't exist" SQL error.
+                    exports.oxmysql:scalar([[
+                        SELECT COUNT(*) FROM information_schema.tables
+                        WHERE table_schema = DATABASE() AND table_name = 'lime_zones'
+                    ]], {}, function(exists)
+                        local function finishFresh()
+                            local fileRaw = LoadResourceFile(GetCurrentResourceName(), 'data.json')
+                            if fileRaw and fileRaw ~= '' and fileRaw ~= '{}' then
+                                local ok, parsed = pcall(json.decode, fileRaw)
+                                if ok then ApplyLoaded(parsed) end
+                            end
+                            SeedIfEmpty()
+                            MergeConfigAdmins()
+                            exports.oxmysql:insert('INSERT INTO lime_redzones (id, data) VALUES (1, ?)', { json.encode(Data) }, function()
+                                done()
+                            end)
+                        end
 
-                    local fileRaw = LoadResourceFile(GetCurrentResourceName(), 'data.json')
-                    if fileRaw and fileRaw ~= '' and fileRaw ~= '{}' then
-                        local ok, parsed = pcall(json.decode, fileRaw)
-                        if ok then ApplyLoaded(parsed) end
-                    end
-                    SeedIfEmpty()
-                    MergeConfigAdmins()
-                    exports.oxmysql:insert('INSERT INTO lime_redzones (id, data) VALUES (1, ?)', { json.encode(Data) }, function()
-                        done()
+                        if (tonumber(exists) or 0) > 0 then
+                            exports.oxmysql:scalar('SELECT data FROM lime_zones WHERE id = 1', {}, function(legacy)
+                                if legacy then
+                                    local ok, parsed = pcall(json.decode, legacy)
+                                    if ok then
+                                        ApplyLoaded(parsed)
+                                        print('^2[lime_redzones] Migrated data from interim lime_zones table.^0')
+                                    end
+                                end
+                                finishFresh()
+                            end)
+                        else
+                            finishFresh()
+                        end
                     end)
                 end
             end)
@@ -159,7 +186,17 @@ local function GetPlayer(src)
     elseif FWName == 'esx' then return FW.GetPlayerFromId(src) end
 end
 
+local function FmtPrize(name, amount)
+    if name == 'money' then return '$' .. amount end
+    if name == 'bank' or name == 'bankmoney' then return '$' .. amount .. ' (bank)' end
+    return amount .. 'x ' .. tostring(name)
+end
+
 local function GetPName(src)
+    if CB and CB.active then
+        local n = CB.GetPlayerName(src)
+        if type(n) == 'string' and n ~= '' then return n end
+    end
     local p = GetPlayer(src)
     if p then
         if FWName == 'qbx' or FWName == 'qb' then
@@ -173,6 +210,10 @@ end
 
 local function RemoveCash(src, amount)
     if amount <= 0 then return true end
+    if CB and CB.active then
+        local r = CB.RemoveCash(src, amount)
+        if r ~= nil then return r ~= false end
+    end
     local p = GetPlayer(src)
     if not p then return FWName == 'none' end
     if FWName == 'qbx' or FWName == 'qb' then
@@ -191,6 +232,7 @@ end
 
 local function AddCash(src, amount)
     if amount <= 0 then return end
+    if CB and CB.active and CB.AddCash(src, amount) then return end
     local p = GetPlayer(src)
     if not p then return end
     if FWName == 'qbx' or FWName == 'qb' then p.Functions.AddMoney('cash', amount, 'redzone')
@@ -199,6 +241,11 @@ end
 
 local function GiveItem(src, item, amount)
     if item == 'money' or item == 'cash' then AddCash(src, amount) return true end
+    if item == 'bank' or item == 'bankmoney' then return AddBank and AddBank(src, amount, 'Redzone Reward') or false end
+    if CB and CB.active then
+        local r = CB.AddItem(src, item, amount)
+        if r ~= nil and r ~= false then return true end
+    end
     if not InvIsFramework() and InvAddItem(src, item, amount) then return true end
     local p = GetPlayer(src)
     if not p then return false end
@@ -300,11 +347,40 @@ local function PlayerDistFromZone(src, zone)
     return #(pos - vector3(zone.coords.x, zone.coords.y, zone.coords.z))
 end
 
+-- Ray-casting point-in-polygon (2D). Zones are prisms: the outline decides
+-- containment, optional min/max Z clamps the height.
+local function PointInPoly(x, y, poly)
+    local inside, n = false, #poly
+    local j = n
+    for i = 1, n do
+        local xi, yi = poly[i].x, poly[i].y
+        local xj, yj = poly[j].x, poly[j].y
+        if ((yi > y) ~= (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) ~= 0 and (yj - yi) or 1e-9) + xi) then
+            inside = not inside
+        end
+        j = i
+    end
+    return inside
+end
+
 local function PlayerInZone(src, zone, slack)
     local dist = PlayerDistFromZone(src, zone)
     -- Fail-open: if position is unreadable (OneSync off / sync gap), trust the
     -- client's own in-zone check rather than silently dropping a real kill.
     if dist == nil then return true end
+
+    if type(zone.poly) == 'table' and #zone.poly >= 3 then
+        local ped = GetPlayerPed(src)
+        if ped == 0 then return true end
+        local p = GetEntityCoords(ped)
+        if zone.polyMinZ and p.z < (zone.polyMinZ - (slack or 30.0)) then return false end
+        if zone.polyMaxZ and p.z > (zone.polyMaxZ + (slack or 30.0)) then return false end
+        if PointInPoly(p.x, p.y, zone.poly) then return true end
+        -- Outside the outline but within slack of the radius still counts, so
+        -- a kill isn't dropped for someone right on the boundary.
+        return dist <= (slack or 30.0)
+    end
+
     return dist <= (zone.radius + (slack or 30.0))
 end
 
@@ -321,7 +397,7 @@ local function GetAdminPerms(src)
         or IsPlayerAceAllowed(src, 'lime_redzones.god')
         or IsPlayerAceAllowed(src, 'god')
         or FrameworkIsAdmin(src) then
-        return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true, _full = true }
+        return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true, logs = true, _full = true }
     end
 
     -- Identifier-based admins: apply their assigned rank's section perms.
@@ -336,7 +412,7 @@ local function GetAdminPerms(src)
     end
 
     -- ACE lime_redzones.admin or a rankless identifier admin: full section access (not _full).
-    return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true }
+    return { zones = true, gangs = true, leaderboards = true, options = true, killfeed = true, logs = true }
 end
 
 -- Section-level permission gate for admin events.
@@ -353,13 +429,20 @@ local function BroadcastZones(target)
 end
 
 local streaks, lastKill, lastDeath, lastGlobal, lastRevive = {}, {}, {}, {}, {}
+-- src -> safe zone id. Set from a client report that the server verifies
+-- against the player's real position, so it can't be spoofed for immunity.
+local playerInSafeZone = {}
+-- Admins currently viewing the panel. Tracked so a change by one staff member
+-- pushes to every other open panel instead of them seeing stale data until
+-- they close and reopen.
+local panelOpen = {}
 local lastRequest = {}
 
 -- Spam guard for request events, keyed per event so they don't block each other.
 local function reqOk(src, gap, key)
     key = key or 'default'
     lastRequest[src] = lastRequest[src] or {}
-    local now = os.clock()
+    local now = GetGameTimer() / 1000.0
     if lastRequest[src][key] and (now - lastRequest[src][key]) < (gap or 0.5) then return false end
     lastRequest[src][key] = now
     return true
@@ -437,7 +520,7 @@ local function GrantPrizeOrQueue(identifier, name, amount)
         if GetIdentifier(src) == identifier then
             GiveItem(src, name, amount)
             NotifySv(src, ('🏆 Leaderboard winner! Prize: %s'):format(
-                name == 'money' and ('$' .. amount) or (amount .. 'x ' .. name)), 'success')
+                FmtPrize(name, amount)), 'success')
             return
         end
     end
@@ -480,7 +563,7 @@ local function DoReset(which)
             desc = ('🏆 **%s** won the weekly %s leaderboard with **%d kills**!'):format(winnerName or 'Unknown', boardName, topKills)
             fields = {}
             if cfg.prizeAmount and cfg.prizeAmount > 0 then
-                fields[#fields+1] = { name = 'Prize', value = (cfg.prizeName == 'money' and ('$' .. cfg.prizeAmount) or (cfg.prizeAmount .. 'x ' .. cfg.prizeName)), inline = true }
+                fields[#fields+1] = { name = 'Prize', value = FmtPrize(cfg.prizeName, cfg.prizeAmount), inline = true }
             end
             fields[#fields+1] = { name = 'Kills', value = tostring(topKills), inline = true }
         else
@@ -522,7 +605,7 @@ AddEventHandler('playerJoining', function()
             Data.pendingPrizes[id] = nil
             GiveItem(src, prize.name, prize.amount)
             NotifySv(src, ('🏆 Leaderboard winner! Prize: %s'):format(
-                prize.name == 'money' and ('$' .. prize.amount) or (prize.amount .. 'x ' .. prize.name)), 'success')
+                FmtPrize(prize.name, prize.amount)), 'success')
             SaveData()
         end
     end)
@@ -545,8 +628,22 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
     local zone = Data.zones[zoneId]
     dbgsv(('giveKillReward from %s zone=%s exists=%s'):format(src, zoneId, tostring(zone ~= nil)))
     if not zone or not zone.enabled then dbgsv('rejected: no/disabled zone') return end
+    if zone.type == 'safezone' then dbgsv('rejected: safe zone') return end
 
-    local now = os.clock()
+    -- Only real players earn kill rewards/leaderboard credit. victimId 0 means
+    -- the client couldn't resolve the victim to a networked player (NPC/ped),
+    -- so reject it here too — don't just trust the client's isFatal/isPlayer flag.
+    if victimId <= 0 then dbgsv('rejected: victim not a resolved player (NPC)') return end
+    if GetPlayerName(victimId) == nil then dbgsv('rejected: victim not a connected player') return end
+
+    -- A safe zone beats a redzone where they overlap: no rewards for killing
+    -- someone standing in one.
+    if victimId > 0 and playerInSafeZone[victimId] then
+        dbgsv('rejected: victim in safe zone')
+        return
+    end
+
+    local now = GetGameTimer() / 1000.0
     if lastKill[src] and (now - lastKill[src]) < 1.5 then dbgsv('rejected: rate limit') return end
 
     if not PlayerInZone(src, zone, 60.0) then dbgsv('rejected: not in zone') return end
@@ -562,7 +659,7 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
         local granted = GiveItem(src, item.name, amt)
         dbgsv(('reward %s x%s -> %s'):format(item.name, amt, tostring(granted)))
         if granted then
-            parts[#parts+1] = item.name == 'money' and ('$' .. amt) or (amt .. 'x ' .. item.name)
+            parts[#parts+1] = FmtPrize(item.name, amt)
         end
     end
     for _, sr in ipairs(zone.streakRewards or {}) do
@@ -570,7 +667,7 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
             local amt = RewardAmount(sr)
             if GiveItem(src, sr.name, amt) then
                 parts[#parts+1] = ('STREAK %d: %s'):format(streak,
-                    sr.name == 'money' and ('$' .. amt) or (amt .. 'x ' .. sr.name))
+                    FmtPrize(sr.name, amt))
             end
         end
     end
@@ -597,9 +694,10 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
 
     TriggerClientEvent('lime_redzones:client:syncStreak', src, streak)
     if Data.settings.options.killFeedEnabled ~= false then
-        local victimName = 'Enemy'
         local vId = tonumber(victimId) or 0
-        if vId > 0 then victimName = GetPName(vId) end
+        -- GetPName falls back to the raw player name, so this only shows
+        -- "Unknown" if the client genuinely couldn't resolve the victim.
+        local victimName = (vId > 0 and GetPlayerName(vId)) and GetPName(vId) or 'Unknown'
         TriggerClientEvent('lime_redzones:client:killFeed', -1, {
             killer = GetPName(src), killerId = src,
             victim = victimName, victimId = vId,
@@ -610,7 +708,7 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
 
     if Log then
         Log('kills', 'Redzone Kill',
-            ('**%s** killed **%s**'):format(GetPName(src), victimName or 'Enemy'),
+            ('**%s** killed **%s**'):format(GetPName(src), victimName),
             {
                 { name = 'Zone',   value = zone.name or zoneId, inline = true },
                 { name = 'Weapon', value = WeaponLabel(weapon), inline = true },
@@ -628,7 +726,7 @@ RegisterNetEvent('lime_redzones:server:reportDeath', function(zoneId)
     local zone = Data.zones[zoneId]
     if not zone then return end
 
-    local now = os.clock()
+    local now = GetGameTimer() / 1000.0
     if lastDeath[src] and (now - lastDeath[src]) < 5.0 then return end
     if not PlayerInZone(src, zone, 50.0) then return end
     lastDeath[src] = now
@@ -654,7 +752,7 @@ end)
 RegisterNetEvent('lime_redzones:server:globalKill', function()
     if Data.settings.options.globalLbEnabled == false then return end
     local src = source
-    local now = os.clock()
+    local now = GetGameTimer() / 1000.0
     if lastGlobal[src] and (now - lastGlobal[src]) < 1.5 then return end
     lastGlobal[src] = now
 
@@ -667,7 +765,7 @@ end)
 RegisterNetEvent('lime_redzones:server:globalDeath', function()
     if Data.settings.options.globalLbEnabled == false then return end
     local src = source
-    local now = os.clock()
+    local now = GetGameTimer() / 1000.0
     if lastDeath[src] and (now - lastDeath[src]) < 3.0 then return end
     lastDeath[src] = now
     local lb = EnsureP(Data.globalLb.players, src)
@@ -681,7 +779,10 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
     local zone = Data.zones[tostring(zoneId)]
     if not zone then return end
 
-    local now = os.clock()
+    -- Rate limit. A silently dropped retry used to leave the player dead with
+    -- no further attempt, so the limiter no longer consumes the request — the
+    -- client keeps its pending request and retries after the window.
+    local now = GetGameTimer() / 1000.0
     if lastRevive[src] and (now - lastRevive[src]) < 8.0 then return end
     lastRevive[src] = now
 
@@ -707,16 +808,31 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
     heading = tonumber(heading) or 0.0
 
     local cost = tonumber(zone.reviveCost) or 0
-    if RemoveCash(src, cost) then
+    local fromBank = zone.reviveCostSource == 'bank'
+
+    -- Branch explicitly. `a and b or c` breaks here: when the bank charge
+    -- returns false the expression falls through and silently charges cash
+    -- instead, which both bills the wrong account and lets broke players
+    -- revive for free.
+    local paid
+    if cost <= 0 then
+        paid = true
+    elseif fromBank then
+        paid = RemoveBank ~= nil and RemoveBank(src, cost, 'Redzone Revive') == true
+    else
+        paid = RemoveCash(src, cost) == true
+    end
+
+    if paid then
         DoRevive(src, coords, heading)
-        if cost > 0 then NotifySv(src, ('Revived — $%s deducted.'):format(cost), 'success') end
+        if cost > 0 then NotifySv(src, ('Revived — $%s deducted%s.'):format(cost, fromBank and ' from bank' or ''), 'success') end
         if Log then
             Log('revives', 'Paid Revive', ('**%s** revived'):format(GetPName(src)),
                 { { name = 'Zone', value = zone.name or tostring(zoneId), inline = true },
-                  { name = 'Cost', value = '$' .. tostring(cost), inline = true } })
+                  { name = 'Cost', value = '$' .. tostring(cost) .. (fromBank and ' (bank)' or ' (cash)'), inline = true } })
         end
     else
-        NotifySv(src, ('You need $%s cash to be revived here.'):format(cost), 'error')
+        NotifySv(src, ('You need $%s %s to be revived here.'):format(cost, fromBank and 'in your bank' or 'cash'), 'error')
         TriggerClientEvent('lime_redzones:client:reviveDenied', src)
     end
 end)
@@ -730,6 +846,61 @@ RegisterNetEvent('lime_redzones:server:requestLeaderboard', function()
     end
     PushLeaderboard(src)
 end)
+RegisterNetEvent('lime_redzones:server:teleportToZone', function(zoneId)
+    local src = source
+    if zoneId == nil then return end
+    if not reqOk(src, 3.0, 'teleport') then
+        NotifySv(src, _U('teleport_cooldown'), 'error')
+        return
+    end
+
+    local zone = Data.zones[tostring(zoneId)]
+    if not zone or not zone.enabled or zone.type == 'safezone' then return end
+    if zone.allowTeleport ~= true then
+        NotifySv(src, _U('teleport_disabled'), 'error')
+        return
+    end
+
+    -- Refuse while dead: teleporting a downed player strands them mid-revive.
+    local ped = GetPlayerPed(src)
+    if ped == 0 or GetEntityHealth(ped) <= 0 then
+        NotifySv(src, _U('teleport_dead'), 'error')
+        return
+    end
+
+    local cost = tonumber(zone.teleportCost) or 0
+    dbgsv(('teleport zone=%s rawCost=%s cost=%d source=%s RemoveBank=%s')
+        :format(tostring(zoneId), tostring(zone.teleportCost), cost,
+                tostring(zone.teleportCostSource), tostring(RemoveBank ~= nil)))
+    if cost > 0 then
+        local fromBank = zone.teleportCostSource == 'bank'
+        local paid
+        if fromBank then
+            paid = RemoveBank ~= nil and RemoveBank(src, cost, 'Redzone Teleport') == true
+        else
+            paid = RemoveCash(src, cost) == true
+        end
+        dbgsv(('teleport charge fromBank=%s paid=%s'):format(tostring(fromBank), tostring(paid)))
+        if not paid then
+            NotifySv(src, ('You need $%s %s to teleport here.'):format(cost, fromBank and 'in your bank' or 'in cash'), 'error')
+            return
+        end
+    end
+
+    -- Prefer a configured spawn point; random so a group teleporting together
+    -- doesn't all land stacked on one spot. Falls back to the zone centre.
+    local dest, exact = zone.coords, false
+    local pts = zone.tpPoints
+    if type(pts) == 'table' and #pts > 0 then
+        dest, exact = pts[math.random(1, #pts)], true
+    end
+
+    TriggerClientEvent('lime_redzones:client:teleportTo', src, dest, zone.name, exact)
+    NotifySv(src, ('Teleporting to %s%s.'):format(zone.name, cost > 0 and (' — $' .. cost .. ' deducted') or ''), 'success')
+    Log('admin', 'Redzone Teleport', ('**%s** teleported to **%s**%s')
+        :format(GetPName(src), zone.name, cost > 0 and (' ($' .. cost .. ')') or ''), nil, GetPName(src))
+end)
+
 RegisterNetEvent('lime_redzones:server:requestZones', function()
     if not reqOk(source, 1.0, 'zones') then return end
     BroadcastZones(source)
@@ -744,20 +915,76 @@ RegisterNetEvent('lime_redzones:server:myIdentifier', function()
         GetPlayerIdentifierByType(src, 'license') or '', GetIdentifier(src))
 end)
 
+-- ── Safe zone presence ──────────────────────────────────────────
+RegisterNetEvent('lime_redzones:server:syncSafePresence', function(zoneId)
+    local src = source
+
+    if zoneId == nil then playerInSafeZone[src] = nil return end
+
+    local z = Data.zones[tostring(zoneId)]
+    if not z or z.type ~= 'safezone' or not z.enabled then playerInSafeZone[src] = nil return end
+
+    local ped = GetPlayerPed(src)
+    if ped == 0 then playerInSafeZone[src] = nil return end
+
+    local pos = GetEntityCoords(ped)
+    local d = #(pos - vector3(z.coords.x, z.coords.y, z.coords.z))
+    -- Tolerance for latency between the client's check and ours.
+    playerInSafeZone[src] = (d <= (z.radius + 15.0)) and tostring(zoneId) or nil
+end)
+
+exports('IsInSafeZone', function(src) return playerInSafeZone[src] ~= nil end)
+
 AddEventHandler('playerDropped', function()
     local src = source
     streaks[src], lastKill[src], lastDeath[src], lastGlobal[src], lastRevive[src], lastRequest[src] = nil, nil, nil, nil, nil, nil
+    playerInSafeZone[src] = nil
+    panelOpen[src] = nil
 end)
 
-local function SendAdminData(src)
+-- Admin teleport: a management tool, not the player-facing paid flow. Free,
+-- works for safe zones and even disabled zones (you often need to stand in a
+-- zone to fix it), gated on the same 'zones' permission as editing them.
+RegisterNetEvent('lime_redzones:server:adminTeleportToZone', function(zoneId)
+    local src = source
+    if not HasPerm(src, 'zones') then NotifySv(src, _U('no_permission'), 'error') return end
+    if zoneId == nil then return end
+    local zone = Data.zones[tostring(zoneId)]
+    if not zone then return end
+    Log('admin', 'Admin Teleport', ('**%s** teleported to zone **%s**'):format(GetPName(src), zone.name or '?'), nil, GetPName(src))
+    TriggerClientEvent('lime_redzones:client:teleportTo', src, zone.coords, zone.name, false)
+end)
+
+-- Re-send this viewer's panel data on demand (the tablet's refresh button).
+RegisterNetEvent('lime_redzones:server:requestAdminData', function()
+    local src = source
+    if not IsAdmin(src) then return end
+    panelOpen[src] = true
     TriggerClientEvent('lime_redzones:client:adminData', src, Data.zones, Data.customGangs, Data.settings, GetAdminPerms(src))
+end)
+
+-- Broadcast to every open panel. Perms are resolved per-viewer, so each admin
+-- still only sees what their own rank allows.
+local function BroadcastAdminData()
+    for src in pairs(panelOpen) do
+        if GetPlayerName(src) and IsAdmin(src) then
+            TriggerClientEvent('lime_redzones:client:adminData', src, Data.zones, Data.customGangs, Data.settings, GetAdminPerms(src))
+        else
+            panelOpen[src] = nil
+        end
+    end
 end
 
 RegisterNetEvent('lime_redzones:server:adminOpen', function()
     local src = source
     if not IsAdmin(src) then NotifySv(src, 'No permission.', 'error') return end
     if not reqOk(src, 1.0, 'adminopen') then return end
+    panelOpen[src] = true
     TriggerClientEvent('lime_redzones:client:openAdmin', src, Data.zones, Data.customGangs, Data.settings, GetAdminPerms(src))
+end)
+
+RegisterNetEvent('lime_redzones:server:adminClosed', function()
+    panelOpen[source] = nil
 end)
 
 local function sanitizeRewards(t, withStreak)
@@ -783,6 +1010,19 @@ local function sanitizeRewards(t, withStreak)
     return out
 end
 
+RegisterNetEvent('lime_redzones:server:beginNpcPlacement', function(zoneId)
+    local src = source
+    if not HasPerm(src, 'zones') then NotifySv(src, _U('no_permission'), 'error') return end
+    if zoneId == nil then return end
+    local zone = Data.zones[tostring(zoneId)]
+    if not zone then NotifySv(src, 'Zone not found.', 'error') return end
+    if zone.type == 'safezone' then NotifySv(src, 'Safe zones cannot have teleport NPCs.', 'error') return end
+    -- Send a plain copy so client-side edits can't touch live data until saved.
+    local ok, copy = pcall(json.decode, json.encode(zone))
+    if not ok then return end
+    TriggerClientEvent('lime_redzones:client:beginNpcPlacement', src, copy)
+end)
+
 RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
     local src = source
     if not HasPerm(src, 'zones') then return end
@@ -802,29 +1042,188 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
         end
     end
 
-    Data.zones[id] = {
+    -- Optional polygon outline. When present the zone is shaped by these
+    -- points instead of the radius; radius stays as the fallback and is still
+    -- used for blips and cheap distance pre-checks.
+    local poly = {}
+    if type(zone.poly) == 'table' then
+        for i = 1, math.min(24, #zone.poly) do
+            local p = zone.poly[i]
+            if type(p) == 'table' and tonumber(p.x) and tonumber(p.y) then
+                poly[#poly+1] = { x = tonumber(p.x), y = tonumber(p.y) }
+            end
+        end
+    end
+    -- Fewer than 3 points can't enclose an area — discard.
+    if #poly < 3 then poly = {} end
+
+    local tpPoints = {}
+    if type(zone.tpPoints) == 'table' then
+        for i = 1, math.min(5, #zone.tpPoints) do
+            local p = zone.tpPoints[i]
+            if type(p) == 'table' then
+                tpPoints[#tpPoints+1] = {
+                    x = tonumber(p.x) or 0, y = tonumber(p.y) or 0, z = tonumber(p.z) or 0,
+                    h = tonumber(p.h) or 0.0,
+                }
+            end
+        end
+    end
+
+    -- Up to 4 physical NPCs placed in the world that offer a "Teleport to
+    -- Redzone" interaction (ox_target/qb-target/qtarget, or E natively).
+    local teleportNpcs = {}
+    if type(zone.teleportNpcs) == 'table' then
+        for i = 1, math.min(4, #zone.teleportNpcs) do
+            local p = zone.teleportNpcs[i]
+            if type(p) == 'table' then
+                teleportNpcs[#teleportNpcs+1] = {
+                    x = tonumber(p.x) or 0, y = tonumber(p.y) or 0, z = tonumber(p.z) or 0,
+                    h = tonumber(p.h) or 0.0,
+                    model = (type(p.model) == 'string' and p.model ~= '' and p.model:sub(1, 60))
+                            or (Config.TeleportNpcModels and Config.TeleportNpcModels[i])
+                            or 'a_m_y_business_01',
+                }
+            end
+        end
+    end
+
+    local ztype = zone.type == 'safezone' and 'safezone' or 'redzone'
+    local isSafe = ztype == 'safezone'
+
+    local base = {
         id = id,
+        type = ztype,
         name = zone.name:sub(1, 40),
         coords = { x = tonumber(zone.coords.x) or 0, y = tonumber(zone.coords.y) or 0, z = tonumber(zone.coords.z) or 0 },
         radius = math.max(10.0, math.min(500.0, tonumber(zone.radius) or 60.0)),
-        colorHex = (type(zone.colorHex) == 'string' and zone.colorHex:match('^#%x%x%x%x%x%x$')) and zone.colorHex or '#FF0000',
-        colorA = math.max(0, math.min(255, math.floor(tonumber(zone.colorA) or 80))),
-        blipSprite = tonumber(zone.blipSprite) or 310,
-        blipColor = tonumber(zone.blipColor) or 1,
-        rewardItems = sanitizeRewards(zone.rewardItems, false),
-        streakRewards = sanitizeRewards(zone.streakRewards, true),
-        reviveCost = math.max(0, tonumber(zone.reviveCost) or 0),
-        reviveInside = zone.reviveInside ~= false,
-        reviveDelay = math.max(1000, tonumber(zone.reviveDelay) or 8000),
-        teleportAway = math.max(5.0, math.min(200.0, tonumber(zone.teleportAway) or 30.0)),
-        exits = exits,
+        colorHex = (type(zone.colorHex) == 'string' and zone.colorHex:match('^#%x%x%x%x%x%x$')) and zone.colorHex
+                   or (isSafe and '#57F187' or '#FF0000'),
+        colorA = math.max(0, math.min(255, math.floor(tonumber(zone.colorA) or (isSafe and 60 or 80)))),
+        blipSprite = tonumber(zone.blipSprite) or (isSafe and 60 or 310),
+        blipColor = tonumber(zone.blipColor) or (isSafe and 2 or 1),
+        poly = poly,
+        showMarker = zone.showMarker ~= false,
+        polyMinZ = tonumber(zone.polyMinZ) or nil,
+        polyMaxZ = tonumber(zone.polyMaxZ) or nil,
+        showBlip = zone.showBlip ~= false,
+        showRadiusBlip = zone.showRadiusBlip ~= false,
         enabled = zone.enabled ~= false,
     }
+
+    if isSafe then
+        -- Safe zones default to KEEPING vehicles (players park here); only
+        -- delete when explicitly enabled.
+        base.deleteVehicleOnEntry = zone.deleteVehicleOnEntry == true
+        -- weaponMode: 'holster' (force unarmed + block fire), 'blockfire'
+        -- (draw allowed, firing blocked), or 'off'. disableWeapons kept in
+        -- sync so any old code / legacy reads still behave.
+        local wm = zone.weaponMode
+        if wm ~= 'holster' and wm ~= 'blockfire' and wm ~= 'off' then
+            wm = (zone.disableWeapons == false) and 'off' or 'holster'
+        end
+        base.weaponMode = wm
+        base.disableWeapons = wm ~= 'off'
+        base.invincible     = zone.invincible ~= false
+        base.phaseThrough   = zone.phaseThrough ~= false
+        base.speedLimit     = math.max(0, math.min(200, math.floor(tonumber(zone.speedLimit) or 0)))
+    else
+        base.rewardItems          = sanitizeRewards(zone.rewardItems, false)
+        base.streakRewards        = sanitizeRewards(zone.streakRewards, true)
+        base.reviveCost           = math.max(0, tonumber(zone.reviveCost) or 0)
+        base.reviveInside         = zone.reviveInside ~= false
+        base.reviveCostSource     = zone.reviveCostSource == 'bank' and 'bank' or 'cash'
+        base.reviveDelay          = math.max(1000, tonumber(zone.reviveDelay) or 8000)
+        base.teleportAway         = math.max(5.0, math.min(200.0, tonumber(zone.teleportAway) or 30.0))
+        base.exits                = exits
+        base.tpPoints             = tpPoints
+        base.teleportNpcs         = teleportNpcs
+        base.deleteVehicleOnEntry = zone.deleteVehicleOnEntry ~= false  -- redzone: default ON
+        base.infiniteStamina      = zone.infiniteStamina == true
+        base.blockOutsideShooting = zone.blockOutsideShooting == true
+        base.allowTeleport        = zone.allowTeleport == true
+        base.teleportCost         = math.max(0, math.floor(tonumber(zone.teleportCost) or 0))
+        base.teleportCostSource   = zone.teleportCostSource == 'bank' and 'bank' or 'cash'
+    end
+
+    Data.zones[id] = base
     SaveData()
     BroadcastZones(-1)
-    SendAdminData(src)
-    NotifySv(src, ('Zone "%s" saved.'):format(Data.zones[id].name), 'success')
+    BroadcastAdminData()
+    NotifySv(src, _U('zone_saved', Data.zones[id].name), 'success')
     if Log then Log('admin', 'Zone Saved', ('**%s** saved zone **%s**'):format(GetPName(src), Data.zones[id].name)) end
+end)
+
+RegisterNetEvent('lime_redzones:server:bulkUpdateZones', function(ids, patch)
+    local src = source
+    if not HasPerm(src, 'zones') then NotifySv(src, _U('no_permission'), 'error') return end
+    if type(ids) ~= 'table' or type(patch) ~= 'table' then return end
+
+    -- Only these option fields can be mass-edited. Locations, radius, name,
+    -- colour, poly shape and per-point data are deliberately excluded — those
+    -- are per-zone and set in the normal editor.
+    local RZ_FIELDS = {
+        enabled = 'bool', showBlip = 'bool', showRadiusBlip = 'bool', showMarker = 'bool',
+        deleteVehicleOnEntry = 'bool', infiniteStamina = 'bool', blockOutsideShooting = 'bool',
+        allowTeleport = 'bool', teleportCost = 'int', teleportCostSource = 'source',
+        reviveCost = 'int', reviveCostSource = 'source', reviveInside = 'bool',
+    }
+    local SAFE_FIELDS = {
+        enabled = 'bool', showBlip = 'bool', showRadiusBlip = 'bool', showMarker = 'bool',
+        deleteVehicleOnEntry = 'bool', invincible = 'bool', phaseThrough = 'bool',
+        speedLimit = 'int', weaponMode = 'wmode',
+    }
+
+    local function coerce(kind, v)
+        if kind == 'bool'   then return v == true end
+        if kind == 'int'    then return math.max(0, math.floor(tonumber(v) or 0)) end
+        if kind == 'source' then return (v == 'bank') and 'bank' or 'cash' end
+        if kind == 'wmode'  then
+            return (v == 'blockfire' or v == 'off') and v or 'holster'
+        end
+        return nil
+    end
+
+    -- Enforce single-type: every selected zone must match the first one's type.
+    local wantType = nil
+    local applied, changedFields = 0, {}
+    for _, id in ipairs(ids) do
+        local z = Data.zones[tostring(id)]
+        if z then
+            local ztype = (z.type == 'safezone') and 'safezone' or 'redzone'
+            if not wantType then wantType = ztype end
+            if ztype == wantType then
+                local fields = (ztype == 'safezone') and SAFE_FIELDS or RZ_FIELDS
+                for k, v in pairs(patch) do
+                    local kind = fields[k]
+                    if kind then
+                        local cv = coerce(kind, v)
+                        if cv ~= nil then z[k] = cv; changedFields[k] = true end
+                    end
+                end
+                -- Keep the legacy weapon flag in sync when weaponMode changes.
+                if fields.weaponMode and patch.weaponMode ~= nil then
+                    z.disableWeapons = z.weaponMode ~= 'off'
+                end
+                applied = applied + 1
+            end
+        end
+    end
+
+    if applied == 0 then NotifySv(src, 'No matching zones updated.', 'error') return end
+    SaveData()
+    BroadcastZones(-1)
+    BroadcastAdminData()
+
+    local fieldList = {}
+    for k in pairs(changedFields) do fieldList[#fieldList+1] = k end
+    NotifySv(src, ('Updated %d zone%s.'):format(applied, applied == 1 and '' or 's'), 'success')
+    if Log then
+        Log('admin', 'Bulk Zone Update',
+            ('**%s** updated **%d** zones (%s)'):format(GetPName(src), applied,
+                #fieldList > 0 and table.concat(fieldList, ', ') or 'no fields'),
+            nil, GetPName(src))
+    end
 end)
 
 RegisterNetEvent('lime_redzones:server:toggleZone', function(zoneId, enabled)
@@ -835,7 +1234,7 @@ RegisterNetEvent('lime_redzones:server:toggleZone', function(zoneId, enabled)
     z.enabled = enabled == true
     SaveData()
     BroadcastZones(-1)
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, ('Zone "%s" %s.'):format(z.name, z.enabled and 'enabled' or 'disabled'), 'success')
     if Log then Log('admin', 'Zone Toggled', ('**%s** %s zone **%s**'):format(GetPName(src), z.enabled and 'enabled' or 'disabled', z.name)) end
 end)
@@ -849,7 +1248,7 @@ RegisterNetEvent('lime_redzones:server:deleteZone', function(zoneId)
     Data.zones[tostring(zoneId)] = nil
     SaveData()
     BroadcastZones(-1)
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, ('Zone "%s" deleted.'):format(name), 'success')
     if Log then Log('admin', 'Zone Deleted', ('**%s** deleted zone **%s**'):format(GetPName(src), name)) end
 end)
@@ -860,7 +1259,7 @@ RegisterNetEvent('lime_redzones:server:saveGang', function(gang)
     if type(gang) ~= 'table' or type(gang.name) ~= 'string' or gang.name == '' then return end
     Data.customGangs[gang.name:sub(1, 30)] = { label = (gang.label or gang.name):sub(1, 40) }
     SaveData()
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, ('Gang "%s" registered.'):format(gang.label or gang.name), 'success')
     if Log then Log('admin', 'Gang Added', ('**%s** added gang **%s**'):format(GetPName(src), gang.label or gang.name)) end
 end)
@@ -870,8 +1269,9 @@ RegisterNetEvent('lime_redzones:server:deleteGang', function(name)
     if not HasPerm(src, 'gangs') then return end
     Data.customGangs[tostring(name)] = nil
     SaveData()
-    SendAdminData(src)
-    NotifySv(src, ('Gang "%s" removed.'):format(tostring(name)), 'success')
+    BroadcastAdminData()
+    NotifySv(src, _U('gang_removed', tostring(name)), 'success')
+    if Log then Log('admin', 'Gang Deleted', ('**%s** deleted gang **%s**'):format(GetPName(src), tostring(name))) end
 end)
 
 RegisterNetEvent('lime_redzones:server:saveResetSettings', function(which, cfg)
@@ -886,9 +1286,10 @@ RegisterNetEvent('lime_redzones:server:saveResetSettings', function(which, cfg)
     cur.prizeName   = type(cfg.prizeName) == 'string' and cfg.prizeName:sub(1, 50) or 'money'
     cur.prizeAmount = math.max(0, math.floor(tonumber(cfg.prizeAmount) or 0))
     SaveData()
-    SendAdminData(src)
+    BroadcastAdminData()
     PushLeaderboard(-1)
-    NotifySv(src, 'Reset schedule saved.', 'success')
+    NotifySv(src, _U('reset_saved'), 'success')
+    if Log then Log('admin', 'Reset Schedule Updated', ('**%s** updated the %s reset schedule'):format(GetPName(src), which == 'globalReset' and 'Global' or 'Redzone')) end
 end)
 
 RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
@@ -913,6 +1314,7 @@ RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
     o.killFeedDuration     = math.max(2000, math.min(20000, math.floor(tonumber(opts.killFeedDuration) or 6000)))
     o.killCamDuration      = math.max(2000, math.min(15000, math.floor(tonumber(opts.killCamDuration) or 5000)))
     o.killCamEnabled       = opts.killCamEnabled ~= false
+    o.tabletAnim           = opts.tabletAnim ~= false
     if opts.hudDefaultPreset then o.hudDefaultPreset = tostring(opts.hudDefaultPreset):sub(1,12) end
     if opts.hudDefaultTheme then o.hudDefaultTheme = tostring(opts.hudDefaultTheme):sub(1,12) end
     if type(opts.lbCols) == 'table' then
@@ -926,7 +1328,7 @@ RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
     SaveData()
     BroadcastZones(-1)
     TriggerClientEvent('lime_redzones:client:syncOptions', -1, o)
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, 'Options saved.', 'success')
     if Log then Log('admin', 'Options Updated', ('**%s** updated server options'):format(GetPName(src))) end
 end)
@@ -953,7 +1355,7 @@ RegisterNetEvent('lime_redzones:server:saveRanks', function(ranks)
     end
     Data.settings.ranks = out
     SaveData()
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, 'Ranks saved.', 'success')
     if Log then Log('admin', 'Ranks Updated', ('**%s** updated admin ranks'):format(GetPName(src))) end
 end)
@@ -969,7 +1371,7 @@ RegisterNetEvent('lime_redzones:server:addAdmin', function(payload)
     end
     Data.settings.admins[#Data.settings.admins+1] = { id = idStr, rank = rank }
     SaveData()
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, ('Admin added: %s'):format(idStr), 'success')
     if Log then Log('admin', 'Admin Added', ('**%s** added admin `%s`'):format(GetPName(src), idStr)) end
 end)
@@ -981,8 +1383,8 @@ RegisterNetEvent('lime_redzones:server:removeAdmin', function(identifier)
         if (type(a) == 'table' and a.id or a) == identifier then
             table.remove(Data.settings.admins, i)
             SaveData()
-            SendAdminData(src)
-            NotifySv(src, ('Admin removed: %s'):format(identifier), 'success')
+            BroadcastAdminData()
+            NotifySv(src, _U('admin_removed', identifier), 'success')
             if Log then Log('admin', 'Admin Removed', ('**%s** removed admin `%s`'):format(GetPName(src), identifier)) end
             return
         end
@@ -993,7 +1395,7 @@ RegisterNetEvent('lime_redzones:server:resetLeaderboard', function(which)
     local src = source
     if not HasPerm(src, 'leaderboards') then return end
     if which == 'global' then DoReset('globalReset') else DoReset('reset') end
-    SendAdminData(src)
+    BroadcastAdminData()
     NotifySv(src, ('%s leaderboard reset.'):format(which == 'global' and 'Global' or 'Redzone'), 'success')
     if Log then Log('admin', 'Leaderboard Reset', ('**%s** reset the %s leaderboard'):format(GetPName(src), which == 'global' and 'Global' or 'Redzone')) end
 end)
@@ -1006,9 +1408,39 @@ end)
 AddEventHandler('onResourceStart', function(res)
     if res ~= GetCurrentResourceName() then return end
     LoadData(function()
-        local c = 0 for _ in pairs(Data.zones) do c = c + 1 end
-        print(('[lime_redzones] ^2Started^0 · FW: ^3%s^0 · Inv: ^3%s^0 · Storage: ^3%s^0 · Zones: ^3%d^0')
-            :format(FWName, GetInventoryName(), HasSQL and 'MySQL' or 'JSON', c))
+        -- Backfill fields added after a zone was first saved. Without this a
+        -- zone stored before a feature existed silently reads as nil — which
+        -- is why teleports on older zones were free (teleportCost absent -> 0).
+        local migrated = 0
+        for _, z in pairs(Data.zones) do
+            local before = migrated
+            if not z.type then z.type = 'redzone'; migrated = migrated + 1 end
+            if z.type ~= 'safezone' then
+                if z.allowTeleport      == nil then z.allowTeleport = false;      migrated = migrated + 1 end
+                if z.teleportCost       == nil then z.teleportCost = 0;           migrated = migrated + 1 end
+                if z.teleportCostSource == nil then z.teleportCostSource = 'cash'; migrated = migrated + 1 end
+                if z.tpPoints           == nil then z.tpPoints = {};              migrated = migrated + 1 end
+                if z.reviveCostSource   == nil then z.reviveCostSource = 'cash';  migrated = migrated + 1 end
+            end
+            if z.showBlip == nil then z.showBlip = true; migrated = migrated + 1 end
+            if z.showMarker == nil then z.showMarker = true; migrated = migrated + 1 end
+            if z.type == 'safezone' and z.weaponMode == nil then
+                z.weaponMode = (z.disableWeapons == false) and 'off' or 'holster'
+                migrated = migrated + 1
+            end
+            if before ~= migrated then z._migrated = nil end
+        end
+        if migrated > 0 then
+            print(('[lime_redzones] ^3Backfilled %d missing field(s) on existing zones.^0'):format(migrated))
+            SaveData()
+        end
+
+        local rz, sz = 0, 0
+        for _, z in pairs(Data.zones) do
+            if z.type == 'safezone' then sz = sz + 1 else rz = rz + 1 end
+        end
+        print(('[lime_redzones] ^2Started^0 · FW: ^3%s^0 · Inv: ^3%s^0 · Storage: ^3%s^0 · Redzones: ^3%d^0 · Safe zones: ^3%d^0')
+            :format(FWName, GetInventoryName(), HasSQL and 'MySQL' or 'JSON', rz, sz))
         Wait(500)
         BroadcastZones(-1)
     end)
@@ -1067,12 +1499,37 @@ function PostLeaderboardLog(board, top)
 end
 _G.PostLeaderboardLog = PostLeaderboardLog
 
-RegisterNetEvent('lime_redzones:server:requestLogs', function(category)
+RegisterNetEvent('lime_redzones:server:wipeLogs', function(payload)
     local src = source
-    if not HasPerm(src, 'options') then return end
-    if GetLogs then
-        TriggerClientEvent('lime_redzones:client:logs', src, category, GetLogs(category, 50))
-    end
+    if not HasPerm(src, 'logs') then return end
+    local category = tostring(type(payload) == 'table' and payload.category or payload or 'all')
+    if category ~= 'all' and category ~= 'admin' and category ~= 'kills' and category ~= 'revives' then return end
+
+    WipeLogs(category, function(affected)
+        NotifySv(src, ('Wiped %d log entr%s.'):format(affected, affected == 1 and 'y' or 'ies'), 'success')
+        -- Logged after the wipe so the record of the wipe itself survives.
+        Log('admin', 'Logs Wiped', ('**%s** wiped %s logs (%d entries)'):format(GetPName(src), category, affected), nil, GetPName(src))
+        GetLogsPaged(category == 'all' and 'admin' or category, 1, 10, nil, function(res)
+            TriggerClientEvent('lime_redzones:client:logs', src, category == 'all' and 'admin' or category, res.entries, res.total, 1)
+        end)
+    end)
+end)
+
+RegisterNetEvent('lime_redzones:server:requestLogs', function(payload)
+    local src = source
+    if not HasPerm(src, 'logs') then return end
+    if not reqOk(src, 0.3, 'logs') then return end
+
+    payload = type(payload) == 'table' and payload or {}
+    local category = tostring(payload.category or 'admin')
+    if category ~= 'admin' and category ~= 'kills' and category ~= 'revives' then category = 'admin' end
+    local page = math.max(1, math.floor(tonumber(payload.page) or 1))
+    local perPage = math.max(5, math.min(50, math.floor(tonumber(payload.perPage) or 10)))
+    local search = type(payload.search) == 'string' and payload.search:sub(1, 60) or nil
+
+    GetLogsPaged(category, page, perPage, search, function(res)
+        TriggerClientEvent('lime_redzones:client:logs', src, category, res.entries, res.total, page)
+    end)
 end)
 
 RegisterNetEvent('lime_redzones:server:saveLogConfig', function(patch)
@@ -1097,6 +1554,7 @@ RegisterNetEvent('lime_redzones:server:saveLogConfig', function(patch)
         L.leaderboardPost.top = math.max(3, math.min(25, math.floor(tonumber(L.leaderboardPost.top) or 10)))
     end
 
+    if patch.retentionDays ~= nil then L.retentionDays = math.max(0, math.min(365, math.floor(tonumber(patch.retentionDays) or 14))) end
     SaveData()  -- persist log settings to SQL
     NotifySv(src, 'Logging settings saved.', 'success')
     if Log then Log('admin', 'Logging Updated', ('**%s** changed logging settings'):format(GetPName(src))) end
@@ -1172,6 +1630,18 @@ RegisterNetEvent('lime_redzones:server:wipePrizeHistory', function()
     TriggerClientEvent('lime_redzones:client:prizeHistory', src, {})
     NotifySv(src, 'Past winners wiped.', 'success')
     if Log then Log('admin', 'Past Winners Wiped', ('**%s** wiped the past winners list'):format(GetPName(src))) end
+end)
+
+RegisterNetEvent('lime_redzones:server:deletePrizeEntry', function(payload)
+    local src = source
+    if not HasPerm(src, 'leaderboards') then return end
+    local idx = tonumber(type(payload) == 'table' and payload.index or payload)
+    if not idx or not Data.prizeHistory or not Data.prizeHistory[idx + 1] then return end
+    local entry = table.remove(Data.prizeHistory, idx + 1)
+    SaveData()
+    TriggerClientEvent('lime_redzones:client:prizeHistory', src, Data.prizeHistory)
+    NotifySv(src, 'Winner entry removed.', 'success')
+    if Log then Log('admin', 'Past Winner Removed', ('**%s** removed a past-winner entry (**%s**)'):format(GetPName(src), entry and entry.name or 'unknown')) end
 end)
 
 RegisterNetEvent('lime_redzones:server:requestPrizeHistory', function()

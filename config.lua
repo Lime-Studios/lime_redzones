@@ -4,6 +4,10 @@
 
 Config = {}
 
+-- Language file to use from locales/. Ships with 'en'; copy en.lua, translate
+-- it, and set this to the new file's name.
+Config.Locale = 'en'
+
 -- Keybinds must be registered at startup. Players can rebind in GTA Settings > Key Bindings.
 Config.LeaderboardKeybindEnabled = true
 Config.LeaderboardKey            = 'F1'
@@ -17,6 +21,14 @@ Config.Admins = {
 -- Logging buffer/appearance (everything else about logging is in the panel & saved to DB).
 Config.LogKeepInMemory = 200          -- recent log entries kept per category for the panel
 Config.LogColor        = 10672181     -- Discord embed colour (decimal) — #A3E635
+
+-- Ped models used (in placement order) for the up-to-4 physical "teleport to
+-- redzone" NPCs placed per zone with /rz_addteleportnpc. Interact with one
+-- (ox_target/qb-target/qtarget, or press E natively) to be teleported to that
+-- zone through the same paid/validated flow as the tablet's Teleport button.
+Config.TeleportNpcModels = {
+    'a_m_y_business_01', 'a_m_y_soucent_01', 'a_f_y_business_02', 'a_m_m_business_01',
+}
 
 -- Weapon hash -> readable label, used in kill feed / logs.
 Config.WeaponNames = {

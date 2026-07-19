@@ -4,12 +4,16 @@
   let { display = false, mode = 'player', tab = 'rzleaderboard',
         zones = {}, gangs = {}, settings = {}, personalColor = null,
         lbData = { players: [], gangs: [], globalPlayers: [], totals: {} },
-        placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logConfig = null, prizeHistory = [], firstTime = false, stats = {},
+        placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logTotal = 0, logConfig = null, prizeHistory = [], firstTime = false, stats = {},
         hudTheme = 'lime', hudPreset = 'top', hudScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit',
         onclose } = $props()
 
   const O = $derived(options ?? {})
-  const P = $derived(perms ?? { zones: true, gangs: true, leaderboards: true, options: true, killfeed: true })
+  const P = $derived(perms ?? { zones: true, gangs: true, leaderboards: true, options: true, killfeed: true, logs: true })
+  // _full (server console, ACE god, framework god/admin) grants every section —
+  // check it rather than the individual key, so a newly added permission can't
+  // silently hide a tab from someone who should see everything.
+  const can = (section) => !!(P._full || P[section])
 
   let activeTab = $state('rzleaderboard')
   let lbTab = $state('players')
@@ -25,7 +29,63 @@
   let kmScaleVal = $state(1)
   let kmThemeVal = $state('inherit')
   let logCat = $state('admin')
+  let logPage = $state(1)
+  let logPerPage = $state(10)
+  let logSearch = $state('')
+  let logView = $state('view')
+  let refreshSpin = $state(false)   // 'view' | 'settings' — entries first, config on its own page
+  let logSearchTimer = null
+  const logPages = $derived(Math.max(1, Math.ceil(logTotal / logPerPage)))
+  function loadLogs(page = logPage) {
+    logPage = page
+    post('requestLogs', { category: logCat, page, perPage: logPerPage, search: logSearch })
+  }
+  function onLogSearch() {
+    clearTimeout(logSearchTimer)
+    logSearchTimer = setTimeout(() => loadLogs(1), 300)
+  }
+  let polyJsonErr = $state(false)
+  // Local editable copy. Binding the textarea straight to a $derived meant
+  // Svelte rewrote the field on every reactive update — a paste was reverted
+  // before onchange could read it. This syncs one-way from the zone, and only
+  // when the user isn't editing.
+  let polyJsonText = $state('[]')
+  let polyJsonFocused = $state(false)
+  $effect(() => {
+    const next = JSON.stringify(editing?.poly ?? [])
+    if (!polyJsonFocused) polyJsonText = next
+  })
+  function applyPolyJson(text) {
+    try {
+      const arr = JSON.parse(text)
+      if (!Array.isArray(arr)) throw 0
+      const pts = arr
+        .filter(p => p && typeof p.x === 'number' && typeof p.y === 'number')
+        .slice(0, 24)
+        .map(p => ({ x: p.x, y: p.y, z: typeof p.z === 'number' ? p.z : 0 }))
+      editing.poly = pts.length >= 3 ? pts : []
+      polyJsonErr = false
+    } catch { polyJsonErr = true }
+  }
+
+  function loadLogsAfterWipe(cat) {
+    post('wipeLogs', { category: cat })
+    logPage = 1
+  }
   let confirmWipe = $state(false)
+  let pendingConfirm = $state(null)
+  let pendingConfirmTimer = null
+  function confirmedClick(key, action) {
+    if (pendingConfirm === key) {
+      clearTimeout(pendingConfirmTimer)
+      pendingConfirm = null
+      action()
+    } else {
+      pendingConfirm = key
+      clearTimeout(pendingConfirmTimer)
+      pendingConfirmTimer = setTimeout(() => { pendingConfirm = null }, 3000)
+    }
+  }
   let manualTut = $state(false)
   let lc = $state(null)
 
@@ -55,6 +115,13 @@
     }
     if (effectiveTab !== 'resets') confirmWipe = false
     if (!display) hubLoaded = false
+  })
+  // Dashboard doesn't push live updates on its own — poll while the tab is open.
+  $effect(() => {
+    if (display && effectiveTab === 'dash') {
+      const iv = setInterval(() => post('requestStats'), 8000)
+      return () => clearInterval(iv)
+    }
   })
   $effect(() => {
     if (display && !idRequested && !myIds) { idRequested = true; post('getMyIdentifier') }
@@ -86,6 +153,33 @@
       .then(r => r.json()).catch(() => ({}))
 
   const zoneList = $derived(Object.values(zones ?? {}))
+  let bulkMode = $state(false)
+  let bulkSel = $state(new Set())          // selected zone ids
+  let bulkType = $state(null)              // locked to first selected zone's type
+  let bulkPatch = $state({})               // only fields the admin touched
+  function bulkToggleSel(z) {
+    const next = new Set(bulkSel)
+    if (next.has(z.id)) { next.delete(z.id) }
+    else {
+      if (bulkSel.size === 0) bulkType = z.type === 'safezone' ? 'safezone' : 'redzone'
+      next.add(z.id)
+    }
+    bulkSel = next
+    if (next.size === 0) { bulkType = null }
+  }
+  function bulkSelectableType(z) {
+    // Once a type is chosen, rows of the other type are locked out.
+    return bulkType === null || (z.type === 'safezone' ? 'safezone' : 'redzone') === bulkType
+  }
+  function bulkExit() { bulkMode = false; bulkSel = new Set(); bulkType = null; bulkPatch = {} }
+  function bulkSetField(k, v) { bulkPatch = { ...bulkPatch, [k]: v } }
+  function bulkUnset(k) { const p = { ...bulkPatch }; delete p[k]; bulkPatch = p }
+  function bulkApply() {
+    if (bulkSel.size === 0 || Object.keys(bulkPatch).length === 0) return
+    post('bulkUpdateZones', { ids: [...bulkSel], patch: bulkPatch })
+    bulkExit()
+  }
+  const tpZones = $derived(Object.values(zones ?? {}).filter(z => z.enabled !== false && z.type !== 'safezone' && z.allowTeleport === true))
   const gangList = $derived(Object.entries(gangs ?? {}).map(([name, g]) => ({ name, label: g.label })))
   const adminList = $derived(settings?.admins ?? [])
   const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
@@ -120,6 +214,12 @@
   const myStanding = $derived(lbRanked.find(isMe) ?? null)
   const myWins = $derived((prizeHistory ?? []).filter(w => myKey && (w.identifier === myKey || w.identifier === myIds?.license || w.identifier === myIds?.identifier)))
   const fmtDate = (t) => { try { return new Date((t ?? 0) * 1000).toLocaleDateString() } catch { return '' } }
+  const fmtPrize = (prize) => {
+    if (!prize) return ''
+    if (prize.name === 'money') return '$' + prize.amount
+    if (prize.name === 'bank' || prize.name === 'bankmoney') return '$' + prize.amount + ' (bank)'
+    return prize.amount + '× ' + prize.name
+  }
   const resetInfo = $derived(effectiveTab === 'leaderboard' ? lbData.totals?.globalReset : lbData.totals?.reset)
   const lbGrid = $derived('44px 1fr' + (lbCols?.kills ? ' 75px' : '') + (lbCols?.deaths ? ' 75px' : '') + (lbCols?.kd ? ' 65px' : ''))
 
@@ -169,6 +269,7 @@
     leaderboardEnabled: true, globalLbEnabled: true, gangLbEnabled: true,
     streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
     killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
+    tabletAnim: true,
     lbCols: { kills: true, deaths: true, kd: true },
   })
   let settingsKey = $state(null)
@@ -185,6 +286,7 @@
         leaderboardEnabled: true, globalLbEnabled: true, gangLbEnabled: true,
         streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
         killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
+        tabletAnim: true,
         lbCols: { kills: true, deaths: true, kd: true },
       }
       opts = { ...def, ...settings.options, lbCols: { ...def.lbCols, ...(settings.options.lbCols ?? {}) } }
@@ -202,6 +304,7 @@
         categories: { admin: true, kills: false, revives: true, ...(logConfig.categories ?? {}) },
         webhooks: { admin: '', kills: '', revives: '', leaderboardRz: '', leaderboardGlobal: '', ...(logConfig.webhooks ?? {}) },
         leaderboardPost: { enabled: false, board: 'redzone', interval: 30, top: 10, ...(logConfig.leaderboardPost ?? {}) },
+        retentionDays: logConfig.retentionDays === undefined ? 14 : Number(logConfig.retentionDays),
       }))
     }
   })
@@ -210,25 +313,49 @@
   $effect(() => {
     if (display && effectiveTab === 'logs' && !logsLoaded) {
       logsLoaded = true
-      post('requestLogs', { category: logCat })
+      loadLogs(1)
       post('requestLogConfig')
     }
     if (!display || effectiveTab !== 'logs') logsLoaded = false
   })
 
-  const blankZone = () => ({
-    id: null, name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
+  const blankZone = (type = 'redzone') => type === 'safezone' ? ({
+    id: null, type: 'safezone', name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
+    colorHex: '#57F187', colorA: 60, blipSprite: 60, blipColor: 2,
+    invincible: true, disableWeapons: true, weaponMode: 'holster', phaseThrough: true, speedLimit: 0, deleteVehicleOnEntry: false,
+    poly: [], polyMinZ: null, polyMaxZ: null,
+    showBlip: true, showRadiusBlip: true, enabled: true,
+  }) : ({
+    id: null, type: 'redzone', name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
     colorHex: '#FF0000', colorA: 80, blipSprite: 310, blipColor: 1,
     rewardItems: [{ name: 'money', amount: 500 }], streakRewards: [],
-    reviveCost: 10000, reviveInside: true, reviveDelay: 8000, teleportAway: 30, exits: [], enabled: true,
+    reviveCost: 10000, reviveInside: true, reviveDelay: 8000, reviveCostSource: 'cash', teleportAway: 30, exits: [], enabled: true,
+    deleteVehicleOnEntry: true, infiniteStamina: false, showBlip: true, showRadiusBlip: true, showMarker: true, blockOutsideShooting: false,
+    allowTeleport: false, teleportCost: 0, teleportCostSource: 'cash', tpPoints: [],
+    poly: [], polyMinZ: null, polyMaxZ: null,
   })
-  function startEdit(z) {
-    editing = JSON.parse(JSON.stringify(z ?? blankZone()))
-    editing.rewardItems ??= []; editing.streakRewards ??= []; editing.exits ??= []
+  const isSafe = $derived(editing?.type === 'safezone')
+  function startEdit(z, type) {
+    editing = JSON.parse(JSON.stringify(z ?? blankZone(type)))
+    editing.type ??= 'redzone'
+    // Redzone-only arrays — the editor binds to them, so they must exist,
+    // but a safe zone has no use for them.
+    if (editing.type !== 'safezone') {
+      editing.rewardItems ??= []; editing.streakRewards ??= []; editing.exits ??= []; editing.tpPoints ??= []
+    }
+    editing.poly ??= []
   }
   async function grabPos(target) {
     const pos = await post('getMyPosition')
-    if (pos?.x !== undefined) { if (target === 'coords') editing.coords = pos; else if (editing.exits.length < 5) editing.exits.push(pos) }
+    if (pos?.x === undefined) return
+    if (target === 'coords') {
+      editing.coords = pos
+    } else if (target === 'tp') {
+      editing.tpPoints ??= []
+      if (editing.tpPoints.length < 5) editing.tpPoints.push(pos)
+    } else if (editing.exits.length < 5) {
+      editing.exits.push(pos)
+    }
   }
   function saveZone() { post('saveZone', editing); editing = null }
   function saveGang() {
@@ -242,6 +369,7 @@
 
   const playerNavAll = [
     { id: 'hub',           label: 'Hub',            icon: 'M3 12l9-9 9 9M5 10v10h14V10' },
+    { id: 'teleport',      label: 'Teleport',        icon: 'M12 2l3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7z' },
     { id: 'rzleaderboard', label: 'RZ Leaderboard', icon: 'M8 21h8M12 17v4M7 4h10v6a5 5 0 0 1-10 0V4z', need: 'leaderboardEnabled' },
     { id: 'leaderboard',   label: 'Leaderboard',    icon: 'M3 13h4v8H3zM10 5h4v16h-4zM17 9h4v12h-4z', need: 'globalLbEnabled' },
     { id: 'color',         label: 'Zone Colour',    icon: 'M12 2a10 10 0 1 0 10 10c0-1-1-2-2-2h-2a2 2 0 0 1-2-2c0-1 1-2 2-2h1a2 2 0 0 0 2-2c0-1-4-2-9-2z', need: 'personalColorEnabled' },
@@ -255,11 +383,11 @@
     { id: 'killfeed', label: 'Feed & Cam',   icon: 'M2 6h20v12H2zM8 10l4 2-4 2z', perm: 'killfeed' },
     { id: 'options',  label: 'Options',      icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', perm: 'options' },
     { id: 'perms',    label: 'Permissions',  icon: 'M12 2l7 4v5c0 5-3.5 9-7 11-3.5-2-7-6-7-11V6l7-4z', perm: 'options' },
-    { id: 'logs',     label: 'Logs',         icon: 'M4 4h16v16H4zM8 9h8M8 13h8M8 17h5', perm: 'options' },
+    { id: 'logs',     label: 'Logs',         icon: 'M4 4h16v16H4zM8 9h8M8 13h8M8 17h5', perm: 'logs' },
   ]
   const nav = $derived(
     mode === 'admin'
-      ? adminNavAll.filter(n => !n.perm || P[n.perm])
+      ? adminNavAll.filter(n => !n.perm || can(n.perm))
       : playerNavAll.filter(n => !n.need || O[n.need] !== false)
   )
   // $derived (not $effect) so an invalid tab can't cause an update loop.
@@ -289,7 +417,10 @@
       {#if mode === 'admin'}<span class="sb-admin">ADMIN</span>{/if}
     </span>
     <span class="sb-right">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M2 9c5.5-5.5 14.5-5.5 20 0M5 12.5c3.9-3.9 10.1-3.9 14 0M8.5 16c2-2 5-2 7 0M12 19.5h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <button class="frame-refresh" class:spinning={refreshSpin} title="Refresh data" aria-label="Refresh"
+        onclick={() => { refreshSpin = true; setTimeout(() => refreshSpin = false, 700); if (mode === 'admin') post('requestAdminData'); if (effectiveTab === 'logs') loadLogs(logPage) }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
       <button class="sb-help" onclick={() => manualTut = true} aria-label="Show tutorial" title="Show tutorial"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.5v.2M12 17h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
       <button class="sb-close" onclick={onclose} aria-label="Close"><svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
     </span>
@@ -351,10 +482,11 @@
             <p class="hint">You haven't won a weekly reset yet. Top the leaderboard to claim a prize!</p>
           {:else}
             {#each myWins.slice(0, 10) as w (w.time + (w.board ?? ''))}
-              <div class="frow inset">
+              <div class="win-row">
                 <span class="win-board" class:global={w.board === 'global'}>{w.board === 'global' ? 'GLOBAL' : 'RZ'}</span>
-                <span class="grow">{w.kills} kills · <span class="dim">{fmtDate(w.time)}</span></span>
-                <span class="win-prize">{w.prize?.name === 'money' ? '$' + w.prize.amount : (w.prize?.amount + '× ' + w.prize?.name)}</span>
+                <span class="win-name">{w.kills} kills</span>
+                <span class="win-prize">{fmtPrize(w.prize)}</span>
+                <span class="win-date">{fmtDate(w.time)}</span>
               </div>
             {/each}
           {/if}
@@ -368,6 +500,31 @@
             <button class="btn" onclick={() => activeTab = 'color'}>Zone Colour</button>
           </div>
         </div>
+
+      {:else if effectiveTab === 'teleport'}
+        <div class="page-head"><h1>Teleport</h1></div>
+        <p class="sub">Jump straight to a redzone. Only zones your staff have opened up appear here.</p>
+
+        {#if tpZones.length === 0}
+          <div class="empty">No redzones are open for teleporting right now.</div>
+        {:else}
+          <div class="tp-grid">
+            {#each tpZones as z (z.id)}
+              <div class="tp-card">
+                <span class="tp-dot" style:background={z.colorHex ?? '#FF0000'}></span>
+                <div class="tp-info">
+                  <b>{z.name}</b>
+                  <span class="tp-meta">{z.radius}m radius{#if (z.teleportCost ?? 0) > 0} · ${z.teleportCost} {z.teleportCostSource === 'bank' ? 'bank' : 'cash'}{:else} · Free{/if}</span>
+                </div>
+                <button class="btn go" class:confirming={pendingConfirm === 'tp:' + z.id}
+                  onclick={() => confirmedClick('tp:' + z.id, () => post('teleportToZone', { id: z.id }))}>
+                  {pendingConfirm === 'tp:' + z.id ? 'Confirm' : 'Teleport'}
+                </button>
+              </div>
+            {/each}
+          </div>
+          <p class="hint">You can't teleport while you're down, and there's a short cooldown between jumps.</p>
+        {/if}
 
       {:else if effectiveTab === 'rzleaderboard' || effectiveTab === 'leaderboard'}
         <div class="page-head">
@@ -384,7 +541,7 @@
         </div>
         {/if}
         {#if resetInfo?.enabled}
-          <div class="reset-line">Resets {resetInfo.label}{#if resetInfo.prize} · 🏆 {resetInfo.prize.name === 'money' ? '$' + resetInfo.prize.amount : resetInfo.prize.amount + 'x ' + resetInfo.prize.name}{/if}</div>
+          <div class="reset-line">Resets {resetInfo.label}{#if resetInfo.prize} · 🏆 {fmtPrize(resetInfo.prize)}{/if}</div>
         {/if}
 
         <div class="lb-tools">
@@ -432,10 +589,11 @@
             <p class="hint">No past winners yet. Win a weekly reset to appear here!</p>
           {:else}
             {#each (prizeHistory ?? []).slice(0, 12) as w (w.time + (w.name ?? ''))}
-              <div class="frow inset">
+              <div class="win-row">
                 <span class="win-board" class:global={w.board === 'global'}>{w.board === 'global' ? 'GLOBAL' : 'RZ'}</span>
-                <span class="grow"><b>{w.name}</b> · {w.kills} kills</span>
-                <span class="win-prize">{w.prize?.name === 'money' ? '$' + w.prize.amount : (w.prize?.amount + '× ' + w.prize?.name)}</span>
+                <span class="win-name"><b>{w.name}</b> · {w.kills} kills</span>
+                <span class="win-prize">{fmtPrize(w.prize)}</span>
+                <span class="win-date">{fmtDate(w.time)}</span>
               </div>
             {/each}
           {/if}
@@ -604,23 +762,94 @@
         </div>
 
       {:else if effectiveTab === 'zones'}
-        <div class="page-head"><h1>Zones</h1><button class="btn go" onclick={() => startEdit(null)}>+ Create Redzone</button></div>
+        <div class="page-head"><h1>Zones</h1>
+          <span class="zbtns">
+            {#if !bulkMode}
+              <button class="btn go" onclick={() => startEdit(null, 'redzone')}>+ Redzone</button>
+              <button class="btn safe" onclick={() => startEdit(null, 'safezone')}>+ Safe Zone</button>
+              {#if zoneList.length > 1}<button class="btn" onclick={() => bulkMode = true}>☑ Bulk Edit</button>{/if}
+            {:else}
+              <button class="btn" onclick={bulkExit}>Cancel</button>
+            {/if}
+          </span>
+        </div>
+        <p class="sub">Redzones are PvP areas with kills and rewards. Safe zones block damage and weapons — a safe zone always wins where the two overlap.</p>
         <div class="ztable">
           <div class="zt-head"><span>NAME</span><span>RADIUS</span><span>ENABLED</span><span class="r">ACTIONS</span></div>
           {#if zoneList.length === 0}<div class="empty">No zones yet.</div>{/if}
           {#each zoneList as z (z.id)}
-            <div class="zt-row">
-              <span class="zname"><span class="zdot" style:background={z.colorHex ?? '#FF0000'}></span>{z.name}</span>
+            <div class="zt-row" class:bulk={bulkMode} class:locked={bulkMode && !bulkSelectableType(z)} class:picked={bulkMode && bulkSel.has(z.id)}>
+              {#if bulkMode}
+                <button class="bchk" class:on={bulkSel.has(z.id)} disabled={!bulkSelectableType(z)} onclick={() => bulkToggleSel(z)} aria-label="Select">
+                  {#if bulkSel.has(z.id)}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{/if}
+                </button>
+              {/if}
+              <span class="zname"><span class="zdot" style:background={z.colorHex ?? '#FF0000'}></span>{z.name}<span class="ztype" class:safe={z.type === 'safezone'}>{z.type === 'safezone' ? 'SAFE' : 'RZ'}</span></span>
               <span class="dim">{z.radius}m</span>
-              <span><button class="sw sm" class:on={z.enabled} onclick={() => post('toggleZone', { id: z.id, enabled: !z.enabled })} aria-label="Toggle"><i></i></button></span>
-              <span class="r acts">
-                <button class="ib" title="Teleport" onclick={() => post('teleportToZone', { id: z.id })}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M12 2v8m0 0l3-3m-3 3L9 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="4" stroke="currentColor" stroke-width="2"/></svg></button>
-                <button class="ib" title="Edit" onclick={() => startEdit(z)}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></button>
-                <button class="ib red" title="Delete" onclick={() => post('deleteZone', { id: z.id })}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+              <span><button class="sw sm" class:on={z.enabled} disabled={bulkMode} onclick={() => post('toggleZone', { id: z.id, enabled: !z.enabled })} aria-label="Toggle"><i></i></button></span>
+              <span class="r acts" class:hidden={bulkMode}>
+                <button class="ib" title="Teleport (admin — free)" onclick={() => post('adminTeleportToZone', { id: z.id })}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M12 2v8m0 0l3-3m-3 3L9 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="17" r="4" stroke="currentColor" stroke-width="2"/></svg></button>
+                <button class="ib" title="Edit" onclick={() => startEdit(z, z.type)}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></button>
+                <button class="ib red" class:confirming={pendingConfirm === 'zone:'+z.id} title={pendingConfirm === 'zone:'+z.id ? 'Click to confirm' : 'Delete'} onclick={() => confirmedClick('zone:'+z.id, () => post('deleteZone', { id: z.id }))}>{#if pendingConfirm === 'zone:'+z.id}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>{/if}</button>
               </span>
             </div>
           {/each}
         </div>
+
+        {#if bulkMode}
+          <div class="bulk-panel">
+            <div class="bulk-head">
+              <b>{bulkSel.size} selected{bulkType ? ' · ' + (bulkType === 'safezone' ? 'Safe zones' : 'Redzones') : ''}</b>
+              <span class="hint">{bulkType ? "Only " + (bulkType === 'safezone' ? 'safe zones' : 'redzones') + " can be added — deselect all to switch type." : 'Pick zones above (one type at a time).'}</span>
+            </div>
+
+            {#if bulkSel.size > 0}
+              <p class="hint">Toggle only what you want to change. Untouched options are left as-is on each zone.</p>
+
+              {#each (bulkType === 'safezone'
+                ? [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['invincible','Invincible inside'],['phaseThrough','Phase through'],['deleteVehicleOnEntry','Delete vehicles on entry']]
+                : [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['showRadiusBlip','Show radius blip'],['deleteVehicleOnEntry','Delete vehicles on entry'],['infiniteStamina','Infinite stamina'],['blockOutsideShooting','Block outside shooting'],['allowTeleport','Allow teleport'],['reviveInside','Revive inside']]
+              ) as f}
+                <div class="bulk-row" class:active={f[0] in bulkPatch}>
+                  <button class="bulk-inc" class:on={f[0] in bulkPatch} onclick={() => (f[0] in bulkPatch) ? bulkUnset(f[0]) : bulkSetField(f[0], true)} aria-label="Include">
+                    {#if f[0] in bulkPatch}<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{/if}
+                  </button>
+                  <span class="bulk-label">{f[1]}</span>
+                  <button class="sw sm" class:on={bulkPatch[f[0]] === true} disabled={!(f[0] in bulkPatch)} onclick={() => bulkSetField(f[0], !bulkPatch[f[0]])} aria-label="Value"><i></i></button>
+                </div>
+              {/each}
+
+              {#if bulkType === 'safezone'}
+                <div class="bulk-row" class:active={'weaponMode' in bulkPatch}>
+                  <button class="bulk-inc" class:on={'weaponMode' in bulkPatch} onclick={() => ('weaponMode' in bulkPatch) ? bulkUnset('weaponMode') : bulkSetField('weaponMode','holster')} aria-label="Include">
+                    {#if 'weaponMode' in bulkPatch}<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{/if}
+                  </button>
+                  <span class="bulk-label">Weapons</span>
+                  <div class="seg" style="opacity:{'weaponMode' in bulkPatch ? 1 : 0.4};pointer-events:{'weaponMode' in bulkPatch ? 'auto' : 'none'}">
+                    <button class:on={bulkPatch.weaponMode === 'holster'} onclick={() => bulkSetField('weaponMode','holster')}>Holstered</button>
+                    <button class:on={bulkPatch.weaponMode === 'blockfire'} onclick={() => bulkSetField('weaponMode','blockfire')}>No fire</button>
+                    <button class:on={bulkPatch.weaponMode === 'off'} onclick={() => bulkSetField('weaponMode','off')}>Allowed</button>
+                  </div>
+                </div>
+              {:else}
+                <div class="bulk-row" class:active={'teleportCost' in bulkPatch}>
+                  <button class="bulk-inc" class:on={'teleportCost' in bulkPatch} onclick={() => ('teleportCost' in bulkPatch) ? (bulkUnset('teleportCost'), bulkUnset('teleportCostSource')) : bulkSetField('teleportCost', 0)} aria-label="Include">
+                    {#if 'teleportCost' in bulkPatch}<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{/if}
+                  </button>
+                  <span class="bulk-label">Teleport cost</span>
+                  {#if 'teleportCost' in bulkPatch}
+                    <input class="bulk-num" type="number" min="0" value={bulkPatch.teleportCost} oninput={(e) => bulkSetField('teleportCost', +e.target.value)} />
+                    <div class="seg"><button class:on={(bulkPatch.teleportCostSource ?? 'cash') !== 'bank'} onclick={() => bulkSetField('teleportCostSource','cash')}>Cash</button><button class:on={bulkPatch.teleportCostSource === 'bank'} onclick={() => bulkSetField('teleportCostSource','bank')}>Bank</button></div>
+                  {/if}
+                </div>
+              {/if}
+
+              <button class="btn go end" disabled={Object.keys(bulkPatch).length === 0} onclick={bulkApply}>
+                Apply to {bulkSel.size} zone{bulkSel.size === 1 ? '' : 's'}{Object.keys(bulkPatch).length > 0 ? ' · ' + Object.keys(bulkPatch).filter(k => k !== 'teleportCostSource').length + ' change' + (Object.keys(bulkPatch).filter(k => k !== 'teleportCostSource').length === 1 ? '' : 's') : ''}
+              </button>
+            {/if}
+          </div>
+        {/if}
 
       {:else if effectiveTab === 'gangs'}
         <div class="page-head"><h1>Gangs</h1></div>
@@ -633,7 +862,7 @@
           <p class="hint">Framework gangs auto-detect — this is for standalone servers.</p>
         </div>
         {#each gangList as g (g.name)}
-          <div class="block row"><b class="gl">{g.label}</b><span class="dim grow">{g.name}</span><button class="ib red" onclick={() => post('deleteGang', { name: g.name })}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></div>
+          <div class="block row"><b class="gl">{g.label}</b><span class="dim grow">{g.name}</span><button class="ib red" class:confirming={pendingConfirm === 'gang:'+g.name} title={pendingConfirm === 'gang:'+g.name ? 'Click to confirm' : 'Delete'} onclick={() => confirmedClick('gang:'+g.name, () => post('deleteGang', { name: g.name }))}>{#if pendingConfirm === 'gang:'+g.name}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>{/if}</button></div>
         {/each}
 
       {:else if effectiveTab === 'resets'}
@@ -644,12 +873,12 @@
             <div class="frow">
               <label class="f"><span>Day</span><select bind:value={s.cfg.day}>{#each DAYS as d, i}<option value={i}>{d}</option>{/each}</select></label>
               <label class="f w70"><span>Hour</span><input type="number" min="0" max="23" bind:value={s.cfg.hour} /></label>
-              <label class="f grow"><span>Prize item</span><input bind:value={s.cfg.prizeName} placeholder="money" /></label>
+              <label class="f grow"><span>Prize item</span><input bind:value={s.cfg.prizeName} placeholder="money (or bank)" /></label>
               <label class="f w90"><span>Amount</span><input type="number" min="0" bind:value={s.cfg.prizeAmount} /></label>
             </div>
             <div class="frow">
               <button class="btn go" onclick={() => post('saveResetSettings', { which: s.which, cfg: s.cfg })}>Save</button>
-              <button class="btn red" onclick={() => post('resetLeaderboard', { which: s.which === 'globalReset' ? 'global' : 'zone' })}>Reset Now</button>
+              <button class="btn red" class:confirming={pendingConfirm === 'reset:'+s.which} onclick={() => confirmedClick('reset:'+s.which, () => post('resetLeaderboard', { which: s.which === 'globalReset' ? 'global' : 'zone' }))}>{pendingConfirm === 'reset:'+s.which ? 'Click to confirm reset' : 'Reset Now'}</button>
             </div>
           </div>
         {/each}
@@ -663,16 +892,22 @@
           {#if (prizeHistory ?? []).length === 0}
             <p class="hint">No recorded winners yet.</p>
           {:else}
-            {#each (prizeHistory ?? []).slice(0, 8) as w (w.time + (w.name ?? ''))}
-              <div class="frow inset">
+            <div class="winners-list">
+            {#each (prizeHistory ?? []) as w, wi (w.time + (w.name ?? ''))}
+              <div class="win-row">
                 <span class="win-board" class:global={w.board === 'global'}>{w.board === 'global' ? 'GLOBAL' : 'RZ'}</span>
-                <span class="grow"><b>{w.name}</b> · {w.kills} kills</span>
-                <span class="win-prize">{w.prize?.name === 'money' ? '$' + w.prize.amount : (w.prize?.amount + '× ' + w.prize?.name)}</span>
+                <span class="win-name"><b>{w.name}</b> · {w.kills} kills</span>
+                <span class="win-prize">{fmtPrize(w.prize)}</span>
+                <span class="win-date">{fmtDate(w.time)}</span>
+                <button class="ib red" class:confirming={pendingConfirm === 'winner:'+wi} title={pendingConfirm === 'winner:'+wi ? 'Click to confirm' : 'Remove'}
+                  onclick={() => confirmedClick('winner:'+wi, () => post('deletePrizeEntry', { index: wi }))}>
+                  {#if pendingConfirm === 'winner:'+wi}✓{:else}✕{/if}
+                </button>
               </div>
             {/each}
-            {#if (prizeHistory ?? []).length > 8}<p class="hint">+ {(prizeHistory.length - 8)} more…</p>{/if}
-            <button class="btn red" onclick={() => { if (confirmWipe) { post('wipePrizeHistory'); confirmWipe = false } else confirmWipe = true }}>
-              {confirmWipe ? 'Click again to confirm wipe' : '🗑 Wipe Past Winners'}
+            </div>
+            <button class="btn red" class:confirming={confirmWipe} onclick={() => { if (confirmWipe) { post('wipePrizeHistory'); confirmWipe = false } else confirmWipe = true }}>
+              {confirmWipe ? 'Click again to confirm wipe' : '🗑 Wipe All Past Winners'}
             </button>
             {#if confirmWipe}<button class="btn" onclick={() => confirmWipe = false}>Cancel</button>{/if}
           {/if}
@@ -685,7 +920,7 @@
           {#if opts.killFeedEnabled}
             <label class="f"><span>Kill feed duration <em>{(((opts.killFeedDuration ?? 6000))/1000).toFixed(1)}s</em></span><input class="track" type="range" min="2000" max="20000" step="500" bind:value={opts.killFeedDuration} /></label>
           {/if}
-          <div class="frow between"><div><b>Kill cam</b><p class="hint">Spectate your killer's POV after dying in a zone.</p></div><button class="sw" class:on={opts.killCamEnabled} onclick={() => opts.killCamEnabled = !opts.killCamEnabled} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Kill cam</b><p class="hint">Spectate your killer's POV after dying in a zone.</p></div><button class="sw" class:on={opts.killCamEnabled} onclick={() => opts.killCamEnabled = !opts.killCamEnabled} aria-label="Toggle"><i></i></button></div>
           {#if opts.killCamEnabled}
             <label class="f"><span>Kill cam duration <em>{(((opts.killCamDuration ?? 5000))/1000).toFixed(1)}s</em></span><input class="track" type="range" min="2000" max="15000" step="500" bind:value={opts.killCamDuration} /></label>
           {/if}
@@ -701,9 +936,9 @@
           <p class="hint">Define what each admin rank can access. Ace god perms always have full access.</p>
           {#each ranks as r, ri}
             <div class="rank-card">
-              <div class="frow between"><input class="rank-name" bind:value={r.name} placeholder="Rank name" /><button class="ib red" onclick={() => ranks.splice(ri, 1)}>✕</button></div>
+              <div class="frow between"><input class="rank-name" bind:value={r.name} placeholder="Rank name" /><button class="ib red" class:confirming={pendingConfirm === 'rank:'+ri} onclick={() => confirmedClick('rank:'+ri, () => ranks.splice(ri, 1))}>{pendingConfirm === 'rank:'+ri ? '✓' : '✕'}</button></div>
               <div class="perm-grid">
-                {#each [['zones','Zones'],['gangs','Gangs'],['leaderboards','Leaderboards'],['killfeed','Feed & Cam'],['options','Options']] as pk}
+                {#each [['zones','Zones'],['gangs','Gangs'],['leaderboards','Leaderboards'],['killfeed','Feed & Cam'],['options','Options'],['logs','Logs']] as pk}
                   <button class="perm-chip" class:on={r.perms[pk[0]]} onclick={() => r.perms[pk[0]] = !r.perms[pk[0]]}>{pk[1]}</button>
                 {/each}
               </div>
@@ -718,7 +953,7 @@
             <div class="frow inset">
               <span class="dim grow mono">{typeof a === 'object' ? a.id : a}</span>
               {#if typeof a === 'object' && a.rank}<span class="rank-tag">{a.rank}</span>{/if}
-              <button class="ib red" onclick={() => post('removeAdminId', { identifier: typeof a === 'object' ? a.id : a })}>✕</button>
+              <button class="ib red" class:confirming={pendingConfirm === 'admin:'+(typeof a === 'object' ? a.id : a)} title={pendingConfirm === 'admin:'+(typeof a === 'object' ? a.id : a) ? 'Click to confirm' : 'Remove'} onclick={() => confirmedClick('admin:'+(typeof a === 'object' ? a.id : a), () => post('removeAdminId', { identifier: typeof a === 'object' ? a.id : a }))}>{pendingConfirm === 'admin:'+(typeof a === 'object' ? a.id : a) ? '✓' : '✕'}</button>
             </div>
           {/each}
           <div class="frow">
@@ -741,6 +976,7 @@
             { k: 'personalColorEnabled', t: 'Personal zone colour', d: 'Players can set their own dome colour.' },
             { k: 'killFeedEnabled', t: 'Kill feed', d: 'Show the redzone kill feed.' },
             { k: 'killCamEnabled', t: 'Kill cam', d: 'Spectate killer on death.' },
+            { k: 'tabletAnim', t: 'Tablet animation', d: 'Hold a tablet prop + animation while the panel is open.' },
             { k: 'rewardNotify', t: 'Reward notifications', d: 'Notify on every kill reward.' },
             { k: 'streakAnnounce', t: 'Streak announcements', d: 'Announce streak unlocks.' },
           ] as f}
@@ -772,25 +1008,61 @@
         <button class="btn go end" onclick={() => post('saveOptions', opts)}>Save Options</button>
 
       {:else if effectiveTab === 'logs'}
-        <div class="page-head"><h1>Logs</h1></div>
-        <div class="seg">
-          <button class:on={logCat === 'admin'} onclick={() => { logCat = 'admin'; post('requestLogs', { category: 'admin' }) }}>Admin</button>
-          <button class:on={logCat === 'kills'} onclick={() => { logCat = 'kills'; post('requestLogs', { category: 'kills' }) }}>Kills</button>
-          <button class:on={logCat === 'revives'} onclick={() => { logCat = 'revives'; post('requestLogs', { category: 'revives' }) }}>Revives</button>
-          <button class="seg-refresh" onclick={() => post('requestLogs', { category: logCat })} title="Refresh">↻</button>
+        <div class="page-head"><h1>Logs</h1><span class="log-count">{logTotal} entr{logTotal === 1 ? 'y' : 'ies'}</span></div>
+        <p class="sub">{logView === 'view' ? 'Every action is saved to your database and searchable here.' : 'Configure what gets logged, retention, webhooks and auto-posting.'}</p>
+
+        <div class="seg log-view-seg">
+          <button class:on={logView === 'view'} onclick={() => { logView = 'view'; loadLogs(logPage) }}>📄 View Logs</button>
+          <button class:on={logView === 'settings'} onclick={() => { logView = 'settings'; if (!lc) post('requestLogConfig') }}>⚙ Settings</button>
+        </div>
+
+        {#if logView === 'view'}
+        <div class="log-tools">
+          <div class="seg">
+            <button class:on={logCat === 'admin'} onclick={() => { logCat = 'admin'; loadLogs(1) }}>Admin</button>
+            <button class:on={logCat === 'kills'} onclick={() => { logCat = 'kills'; loadLogs(1) }}>Kills</button>
+            <button class:on={logCat === 'revives'} onclick={() => { logCat = 'revives'; loadLogs(1) }}>Revives</button>
+          </div>
+          <div class="lb-search">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <input placeholder="Search logs…" bind:value={logSearch} oninput={onLogSearch} />
+            {#if logSearch}<button class="lb-clear" onclick={() => { logSearch = ''; loadLogs(1) }} aria-label="Clear">✕</button>{/if}
+          </div>
+          <select class="lb-sort" bind:value={logPerPage} onchange={() => loadLogs(1)}>
+            <option value={10}>10</option>
+            <option value={25}>25</option>
+            <option value={50}>50</option>
+          </select>
+          <button class="btn" onclick={() => loadLogs(logPage)} title="Refresh">↻</button>
         </div>
 
         <div class="logs">
-          {#if (logs ?? []).length === 0}<div class="empty">No log entries yet.</div>{/if}
-          {#each logs ?? [] as e (e.time + (e.title ?? ''))}
+          {#if (logs ?? []).length === 0}<div class="empty">{logSearch ? 'No logs match that search.' : 'No log entries yet.'}</div>{/if}
+          {#if (logs ?? []).length > 0}
+            <div class="log-head"><span>ID</span><span>ACTION</span><span class="r">DATE</span></div>
+          {/if}
+          {#each logs ?? [] as e (e.id ?? (e.time + (e.title ?? '')))}
             <div class="log-row">
-              <div class="log-top"><b>{e.title}</b><span class="log-time">{fmtTime(e.time)}</span></div>
-              {#if e.description}<div class="log-desc">{stripMd(e.description)}</div>{/if}
-              {#if e.fields}<div class="log-fields">{#each e.fields as f}<span class="log-field">{f.name}: <b>{f.value}</b></span>{/each}</div>{/if}
+              <span class="log-id">{e.id ?? '—'}</span>
+              <div class="log-main">
+                <div class="log-top"><b>{e.title}</b>{#if e.actor}<span class="log-actor">{e.actor}</span>{/if}</div>
+                {#if e.description}<div class="log-desc">{stripMd(e.description)}</div>{/if}
+                {#if e.fields}<div class="log-fields">{#each e.fields as f}<span class="log-field">{f.name}: <b>{f.value}</b></span>{/each}</div>{/if}
+              </div>
+              <span class="log-time">{fmtTime(e.time)}</span>
             </div>
           {/each}
         </div>
 
+        {#if logPages > 1}
+          <div class="pager">
+            <button class="btn" disabled={logPage <= 1} onclick={() => loadLogs(logPage - 1)}>← Prev</button>
+            <span class="pager-at">Page {logPage} of {logPages}</span>
+            <button class="btn" disabled={logPage >= logPages} onclick={() => loadLogs(logPage + 1)}>Next →</button>
+          </div>
+        {/if}
+
+        {:else}
         <div class="block">
           <b class="blk-title">Log Settings</b>
           {#if lc}
@@ -798,6 +1070,16 @@
             <div class="frow between"><div><b>Admin actions</b></div><button class="sw" class:on={lc.categories.admin} onclick={() => lc.categories = { ...lc.categories, admin: !lc.categories.admin }} aria-label="Toggle"><i></i></button></div>
             <div class="frow between"><div><b>Kills</b><p class="hint">High volume — off by default.</p></div><button class="sw" class:on={lc.categories.kills} onclick={() => lc.categories = { ...lc.categories, kills: !lc.categories.kills }} aria-label="Toggle"><i></i></button></div>
             <div class="frow between"><div><b>Revives</b></div><button class="sw" class:on={lc.categories.revives} onclick={() => lc.categories = { ...lc.categories, revives: !lc.categories.revives }} aria-label="Toggle"><i></i></button></div>
+            <div class="frow between"><div><b>Keep logs for</b><p class="hint">Entries older than this are deleted automatically. 0 = keep forever.</p></div><label class="f w90"><span>Days</span><input type="number" min="0" max="365" bind:value={lc.retentionDays} /></label></div>
+            <div class="frow">
+              <button class="btn red" class:confirming={pendingConfirm === 'wipe:' + logCat} onclick={() => confirmedClick('wipe:' + logCat, () => loadLogsAfterWipe(logCat))}>
+                {pendingConfirm === 'wipe:' + logCat ? 'Confirm — wipe ' + logCat : '🗑 Wipe ' + logCat + ' logs'}
+              </button>
+              <button class="btn red" class:confirming={pendingConfirm === 'wipe:all'} onclick={() => confirmedClick('wipe:all', () => loadLogsAfterWipe('all'))}>
+                {pendingConfirm === 'wipe:all' ? 'Confirm — wipe EVERYTHING' : '🗑 Wipe all logs'}
+              </button>
+            </div>
+            <p class="hint">Wiping only clears logs stored in your database — Discord webhook messages already sent can't be removed from Discord.</p>
 
             <b class="blk-title" style="margin-top:6px">Discord Webhooks</b>
             <label class="f"><span>Admin</span><input bind:value={lc.webhooks.admin} placeholder="https://discord.com/api/webhooks/…" /></label>
@@ -823,6 +1105,7 @@
             <button class="btn dash" onclick={() => post('requestLogConfig')}>Load log settings</button>
           {/if}
         </div>
+        {/if}
       {/if}
     </div>
   </div>
@@ -831,11 +1114,42 @@
   <div class="editor">
     <div class="e-head"><b>{editing.id ? 'Edit Redzone' : 'Create New Redzone'}</b><button class="ib" onclick={() => editing = null} aria-label="Close"><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button></div>
     <div class="e-body">
-      <label class="f"><span>Redzone Name</span><input bind:value={editing.name} placeholder="e.g., Humane Labs" maxlength="40" /></label>
+      <label class="f"><span>{isSafe ? 'Safe Zone Name' : 'Redzone Name'}</span><input bind:value={editing.name} placeholder={isSafe ? 'e.g., Legion Square' : 'e.g., Humane Labs'} maxlength="40" /></label>
+      <div class="e-sec">Zone Shape</div>
+      {#if (editing.poly?.length ?? 0) >= 3}
+        <div class="frow inset">
+          <span class="dim grow">Custom shape — {editing.poly.length} corners</span>
+          <button class="ib red" onclick={() => editing.poly = []} title="Clear shape">✕</button>
+        </div>
+        <p class="hint">The radius below is still used for the map blip and distance checks, but the outline decides who's inside.</p>
+      {:else}
+        <p class="hint">Circular by default. Draw a custom outline to fit streets, buildings or an irregular area.</p>
+      {/if}
+      <div class="frow">
+        <button class="btn go" onclick={() => post('startPlacement', { draft: JSON.parse(JSON.stringify(editing)), mode: 'poly' })}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          {(editing.poly?.length ?? 0) >= 3 ? 'Redraw shape' : 'Draw shape in world'}
+        </button>
+      </div>
+      {#if (editing.poly?.length ?? 0) >= 3}
+        <div class="frow">
+          <label class="f grow"><span>Min height (Z)</span><input type="number" placeholder="auto" bind:value={editing.polyMinZ} /></label>
+          <label class="f grow"><span>Max height (Z)</span><input type="number" placeholder="auto" bind:value={editing.polyMaxZ} /></label>
+        </div>
+      {/if}
+      <label class="f"><span>Zone points (JSON) {#if polyJsonErr}<em class="err">invalid — not applied</em>{/if}</span>
+        <textarea class="poly-json" rows="3" spellcheck="false" bind:value={polyJsonText}
+          onfocus={() => polyJsonFocused = true}
+          onblur={() => { polyJsonFocused = false; applyPolyJson(polyJsonText) }}
+          oninput={() => applyPolyJson(polyJsonText)}
+          placeholder={'Paste points: [{"x":0,"y":0,"z":30}, …] — or draw in world above'}></textarea>
+      </label>
+
       <div class="f"><span>Coordinates</span><div class="frow"><input type="number" step="0.01" bind:value={editing.coords.x} /><input type="number" step="0.01" bind:value={editing.coords.y} /><input type="number" step="0.01" bind:value={editing.coords.z} /><button class="ib lime" onclick={() => grabPos('coords')} title="Use my position"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></div></div>
       <label class="f"><span>Radius <em>{editing.radius}m</em></span><input class="track" type="range" min="10" max="300" bind:value={editing.radius} /></label>
-      <div class="f"><span>Zone Colour (Global) <em>{editing.colorHex}</em></span><div class="frow"><input class="hexfield" bind:value={editing.colorHex} maxlength="7" spellcheck="false" /><input class="track grow" type="range" min="0" max="255" bind:value={editing.colorA} title="Opacity" /><span class="zdot big" style:background={editing.colorHex}></span></div></div>
+      <div class="f"><span>{isSafe ? 'Zone Colour' : 'Zone Colour (Global)'} <em>{editing.colorHex}</em></span><div class="frow"><input class="hexfield" bind:value={editing.colorHex} maxlength="7" spellcheck="false" /><input class="track grow" type="range" min="0" max="255" bind:value={editing.colorA} title="Opacity" /><span class="zdot big" style:background={editing.colorHex}></span></div></div>
 
+      {#if !isSafe}
       <div class="e-sec">Respawn Points <span class="dim">({editing.exits.length}/5)</span></div>
       {#each editing.exits as e, i}
         <div class="frow inset"><span class="dim grow">{(+e.x).toFixed(1)}, {(+e.y).toFixed(1)}, {(+e.z).toFixed(1)}</span><button class="ib red" onclick={() => editing.exits.splice(i, 1)}>✕</button></div>
@@ -848,7 +1162,7 @@
       <div class="e-sec">Kill Rewards</div>
       {#each editing.rewardItems as item, i}
         <div class="frow inset">
-          <input class="grow" bind:value={item.name} placeholder="item ('money' = cash)" />
+          <input class="grow" bind:value={item.name} placeholder="item ('money'=cash, 'bank'=bank)" />
           {#if item.rand}
             <input class="w70" type="number" min="1" bind:value={item.min} placeholder="min" /><span class="dim">–</span><input class="w70" type="number" min="1" bind:value={item.max} placeholder="max" />
           {:else}
@@ -869,12 +1183,72 @@
       <div class="e-sec">Revive</div>
       <div class="frow">
         <div class="f"><span>Paid revive</span><button class="sw" class:on={editing.reviveInside} onclick={() => editing.reviveInside = !editing.reviveInside} aria-label="Toggle"><i></i></button></div>
-        <label class="f grow"><span>Cost ($)</span><input type="number" min="0" bind:value={editing.reviveCost} disabled={!editing.reviveInside} /></label>
+        <label class="f grow"><span>Cost</span><input type="number" min="0" bind:value={editing.reviveCost} disabled={!editing.reviveInside} /></label>
         <label class="f grow"><span>Delay <em>{(editing.reviveDelay/1000).toFixed(1)}s</em></span><input class="track" type="range" min="1000" max="30000" step="500" bind:value={editing.reviveDelay} /></label>
       </div>
+      <div class="f"><span>Cost taken from</span>
+        <div class="seg">
+          <button class:on={(editing.reviveCostSource ?? 'cash') === 'cash'} onclick={() => editing.reviveCostSource = 'cash'}>Cash</button>
+          <button class:on={editing.reviveCostSource === 'bank'} onclick={() => editing.reviveCostSource = 'bank'}>Bank</button>
+        </div>
+      </div>
+
+      <div class="e-sec">Zone Behaviour</div>
+      <div class="frow between"><div><b>Delete vehicles on entry</b><p class="hint">Cars are removed instantly when they drive into this zone.</p></div><button class="sw" class:on={editing.deleteVehicleOnEntry !== false} onclick={() => editing.deleteVehicleOnEntry = editing.deleteVehicleOnEntry === false ? true : false} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Infinite stamina</b><p class="hint">Players never run out of breath while inside.</p></div><button class="sw" class:on={editing.infiniteStamina === true} onclick={() => editing.infiniteStamina = !editing.infiniteStamina} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Block shooting from outside</b><p class="hint">Players outside can't fire in — stops perimeter camping.</p></div><button class="sw" class:on={editing.blockOutsideShooting === true} onclick={() => editing.blockOutsideShooting = !editing.blockOutsideShooting} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Allow teleport here</b><p class="hint">Lists this zone on the player Teleport tab.</p></div><button class="sw" class:on={editing.allowTeleport === true} onclick={() => editing.allowTeleport = !editing.allowTeleport} aria-label="Toggle"><i></i></button></div>
+      {#if editing.allowTeleport}
+        <div class="frow">
+          <label class="f grow"><span>Teleport cost</span><input type="number" min="0" bind:value={editing.teleportCost} /></label>
+          <div class="f"><span>Taken from</span>
+            <div class="seg">
+              <button class:on={(editing.teleportCostSource ?? 'cash') === 'cash'} onclick={() => editing.teleportCostSource = 'cash'}>Cash</button>
+              <button class:on={editing.teleportCostSource === 'bank'} onclick={() => editing.teleportCostSource = 'bank'}>Bank</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="e-sec">Teleport Arrival Points <span class="dim">({editing.tpPoints?.length ?? 0}/5)</span></div>
+        {#each editing.tpPoints ?? [] as p, i}
+          <div class="frow inset">
+            <span class="dim grow">{(+p.x).toFixed(1)}, {(+p.y).toFixed(1)}, {(+p.z).toFixed(1)} <span class="tp-head">facing {Math.round(+p.h ?? 0)}°</span></span>
+            <button class="ib red" onclick={() => editing.tpPoints.splice(i, 1)}>✕</button>
+          </div>
+        {/each}
+        {#if (editing.tpPoints?.length ?? 0) < 5}
+          <div class="frow">
+            <button class="btn dash" onclick={() => grabPos('tp')}>+ Add my position</button>
+            <button class="btn go" onclick={() => post('startPlacement', { draft: JSON.parse(JSON.stringify(editing)), mode: 'tp' })}><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z" stroke="currentColor" stroke-width="2"/></svg> Place in world (E)</button>
+          </div>
+        {/if}
+        <p class="hint">Players arrive at a random point from this list, facing the direction you were. Leave empty to drop them at the zone centre.</p>
+      {/if}
+      {/if}
+
+      {#if isSafe}
+      <div class="e-sec">Safe Zone Rules</div>
+      <div class="frow between"><div><b>Players invincible inside</b><p class="hint">Blocks all damage — bullets, vehicles, explosions.</p></div><button class="sw" class:on={editing.invincible !== false} onclick={() => editing.invincible = editing.invincible === false ? true : false} aria-label="Toggle"><i></i></button></div>
+      <div class="f"><span>Weapons</span>
+        <div class="seg wide">
+          <button class:on={(editing.weaponMode ?? (editing.disableWeapons === false ? 'off' : 'holster')) === 'holster'} onclick={() => editing.weaponMode = 'holster'}>Holstered</button>
+          <button class:on={(editing.weaponMode ?? (editing.disableWeapons === false ? 'off' : 'holster')) === 'blockfire'} onclick={() => editing.weaponMode = 'blockfire'}>Drawn, can't fire</button>
+          <button class:on={(editing.weaponMode ?? (editing.disableWeapons === false ? 'off' : 'holster')) === 'off'} onclick={() => editing.weaponMode = 'off'}>Allowed</button>
+        </div>
+      </div>
+      <p class="hint">{(editing.weaponMode ?? (editing.disableWeapons === false ? 'off' : 'holster')) === 'holster' ? 'Guns are forced away and can\'t be drawn, aimed or fired.' : (editing.weaponMode === 'blockfire' ? 'Players can draw and aim, but firing and drivebys do nothing.' : 'No weapon restriction inside this zone.')}</p>
+      <div class="frow between"><div><b>Phase through players & vehicles</b><p class="hint">Players and cars pass through each other — no ramming, no shoving.</p></div><button class="sw" class:on={editing.phaseThrough !== false} onclick={() => editing.phaseThrough = editing.phaseThrough === false ? true : false} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Speed limit</b><p class="hint">Caps vehicle speed inside the zone. 0 = no limit.</p></div><label class="f w90"><span>MPH</span><input type="number" min="0" max="200" bind:value={editing.speedLimit} /></label></div>
+      <div class="frow between"><div><b>Delete vehicles on entry</b><p class="hint">Removes the car when a player drives in. Off by default — greenzones are usually where people park.</p></div><button class="sw" class:on={editing.deleteVehicleOnEntry === true} onclick={() => editing.deleteVehicleOnEntry = editing.deleteVehicleOnEntry !== true} aria-label="Toggle"><i></i></button></div>
+      {/if}
+
+      <div class="frow between"><div><b>Show zone visual</b><p class="hint">The in-world dome/walls. Off = invisible zone, still fully active — and cheaper to run.</p></div><button class="sw" class:on={editing.showMarker !== false} onclick={() => editing.showMarker = editing.showMarker === false} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Show blip on map</b><p class="hint">The zone's map icon. Turn off to hide the zone entirely.</p></div><button class="sw" class:on={editing.showBlip !== false} onclick={() => editing.showBlip = editing.showBlip === false ? true : false} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Show circle on map</b><p class="hint">The radius ring around the blip.</p></div><button class="sw" class:on={editing.showRadiusBlip !== false} onclick={() => editing.showRadiusBlip = editing.showRadiusBlip === false ? true : false} aria-label="Toggle" disabled={editing.showBlip === false}><i></i></button></div>
+
       <div class="frow"><div class="f"><span>Zone enabled</span><button class="sw" class:on={editing.enabled} onclick={() => editing.enabled = !editing.enabled} aria-label="Toggle"><i></i></button></div></div>
     </div>
-    <div class="e-foot"><button class="btn" onclick={() => editing = null}>Cancel</button><button class="btn go" onclick={saveZone}>Save Redzone</button></div>
+    <div class="e-foot"><button class="btn" onclick={() => editing = null}>Cancel</button><button class="btn go" onclick={saveZone}>{isSafe ? 'Save Safe Zone' : 'Save Redzone'}</button></div>
   </div>
   {/if}
 </div>
@@ -908,10 +1282,12 @@
   .nav-item.admin-entry:hover { background: var(--accent-soft); color: var(--accent); }
 
   .content { flex: 1; overflow-y: auto; padding: 18px 22px 26px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
-  .content::-webkit-scrollbar, .e-body::-webkit-scrollbar { width: 8px; }
-  .content::-webkit-scrollbar-track, .e-body::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
-  .content::-webkit-scrollbar-thumb, .e-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
-  .content::-webkit-scrollbar-thumb:hover, .e-body::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+  /* One scrollbar look everywhere — the logs list (and any other inner
+     scroller) previously fell back to the browser default. */
+  .content::-webkit-scrollbar, .e-body::-webkit-scrollbar, .logs::-webkit-scrollbar, .tab-body ::-webkit-scrollbar { width: 8px; }
+  .content::-webkit-scrollbar-track, .e-body::-webkit-scrollbar-track, .logs::-webkit-scrollbar-track, .tab-body ::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
+  .content::-webkit-scrollbar-thumb, .e-body::-webkit-scrollbar-thumb, .logs::-webkit-scrollbar-thumb, .tab-body ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  .content::-webkit-scrollbar-thumb:hover, .e-body::-webkit-scrollbar-thumb:hover, .logs::-webkit-scrollbar-thumb:hover, .tab-body ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
 
   .page-head { display: flex; align-items: center; justify-content: space-between; }
   h1 { font-size: 19px; font-weight: 900; color: #fff; letter-spacing: -0.02em; }
@@ -926,6 +1302,8 @@
   .pill { font-size: 11px; color: var(--text-2); background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); border-radius: 99px; padding: 5px 12px; }
   .pill b { color: var(--accent); font-weight: 900; }
   .seg { display: inline-flex; gap: 3px; align-self: flex-start; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 99px; padding: 3px; }
+  .seg.wide { display: flex; width: 100%; }
+  .seg.wide button { flex: 1; }
   .seg button { padding: 6px 16px; border: none; border-radius: 99px; background: transparent; color: var(--text-3); font-size: 11.5px; font-weight: 800; font-family: inherit; cursor: pointer; }
   .seg button.on { background: var(--accent); color: var(--accent-text); }
   .reset-line { font-size: 11px; color: var(--text-2); }
@@ -967,6 +1345,8 @@
   .ib { width: 27px; height: 27px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.07); border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-2); font-size: 11px; }
   .ib:hover { background: rgba(255,255,255,0.1); color: #fff; }
   .ib.red:hover { color: var(--danger); }
+  .ib.confirming, .btn.confirming { background: var(--danger) !important; color: #fff !important; animation: pulse-confirm 0.9s ease-in-out infinite; }
+  @keyframes pulse-confirm { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
   .ib.lime { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
 
   .block { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.05); border-radius: 14px; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
@@ -1039,6 +1419,7 @@
 
   .seg-refresh { padding: 6px 12px !important; font-size: 14px !important; }
   .logs { display: flex; flex-direction: column; gap: 5px; max-height: 280px; overflow-y: auto; }
+  .winners-list { display: flex; flex-direction: column; gap: 5px; max-height: 240px; overflow-y: auto; margin-bottom: 8px; }
   .log-row { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.05); border-radius: 10px; padding: 9px 12px; display: flex; flex-direction: column; gap: 4px; }
   .log-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
   .log-top b { font-size: 12.5px; color: #fff; font-weight: 800; }
@@ -1076,4 +1457,64 @@
   .lb-sort option { background: #1d2026; color: #fff; }
   .lb-row.me { background: var(--accent-soft); border-radius: 8px; box-shadow: inset 0 0 0 1px var(--accent); }
   .you-tag { font-size: 8.5px; font-weight: 900; letter-spacing: 0.06em; background: var(--accent); color: var(--accent-text); padding: 1px 5px; border-radius: 4px; margin-left: 7px; }
+
+  .zbtns { display: flex; gap: 8px; }
+  .btn.safe { background: rgba(87,241,135,0.14); color: #57F187; }
+  .ztype { font-size: 8.5px; font-weight: 900; letter-spacing: 0.06em; padding: 1px 5px; border-radius: 4px; margin-left: 7px; background: var(--danger-soft); color: var(--danger); }
+  .ztype.safe { background: rgba(87,241,135,0.14); color: #57F187; }
+
+  .log-head { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; padding: 4px 12px; font-size: 9.5px; font-weight: 900; letter-spacing: 0.08em; color: var(--text-3); }
+  .log-head .r { text-align: right; }
+  .log-row { display: grid; grid-template-columns: 34px 1fr auto; gap: 10px; align-items: start; }
+  .log-id { font-size: 11px; font-weight: 800; color: var(--text-3); padding-top: 1px; }
+  .log-main { min-width: 0; }
+  .btn.sm { padding: 5px 10px; font-size: 11px; }
+
+  .log-tools { display: flex; gap: 8px; margin-bottom: 8px; align-items: stretch; }
+  .log-tools .seg { flex: 0 0 auto; }
+  .log-count { font-size: 11px; font-weight: 800; color: var(--text-3); }
+  .log-actor { font-size: 10px; font-weight: 800; color: var(--accent); background: var(--accent-soft); padding: 1px 6px; border-radius: 4px; margin-left: 7px; }
+  .pager { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
+  .pager-at { font-size: 11px; font-weight: 700; color: var(--text-3); }
+  .btn:disabled { opacity: 0.35; cursor: default; }
+  .tp-grid { display: flex; flex-direction: column; gap: 7px; }
+  .tp-card { display: flex; align-items: center; gap: 11px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 11px 13px; }
+  .tp-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+  .tp-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+  .tp-meta { font-size: 10.5px; color: var(--text-3); }
+
+  .tp-head { font-size: 10px; color: var(--accent); font-weight: 700; margin-left: 4px; }
+
+  .win-row { display: flex; align-items: center; gap: 9px; flex-wrap: nowrap; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 10px; padding: 8px 10px; margin-bottom: 5px; }
+  .win-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  .win-date { font-size: 10px; color: var(--text-3); white-space: nowrap; flex-shrink: 0; }
+  .win-row .win-prize, .win-row .win-board, .win-row .ib { flex-shrink: 0; }
+
+  .poly-json { background: #101408; border: 1px solid rgba(255,255,255,0.13); border-radius: 9px; padding: 8px 10px; color: rgba(255,255,255,0.85); font-family: monospace; font-size: 10px; line-height: 1.5; resize: vertical; outline: none; width: 100%; box-sizing: border-box; }
+  .poly-json:focus { border-color: var(--accent); }
+  .f .err { color: #f87171; font-style: normal; }
+
+  .log-view-seg { margin-bottom: 12px; }
+  .log-view-seg button { padding: 7px 16px; font-size: 12px; }
+
+  .frame-refresh { background: none; border: none; color: rgba(255,255,255,0.75); cursor: pointer; padding: 4px; display: flex; align-items: center; border-radius: 6px; }
+  .frame-refresh:hover { color: var(--accent); background: rgba(255,255,255,0.06); }
+  .frame-refresh.spinning svg { animation: fr-spin 0.7s ease; }
+  @keyframes fr-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  .zt-row.bulk { grid-template-columns: 34px 1fr 80px 85px 110px; cursor: default; }
+  .zt-row.locked { opacity: 0.35; }
+  .zt-row.picked { background: rgba(163,230,53,0.07); }
+  .acts.hidden { visibility: hidden; }
+  .bchk { width: 22px; height: 22px; border-radius: 6px; border: 1.5px solid rgba(255,255,255,0.25); background: transparent; color: #0b0d08; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .bchk.on { background: var(--accent); border-color: var(--accent); }
+  .bchk:disabled { cursor: not-allowed; opacity: 0.4; }
+  .bulk-panel { margin-top: 12px; background: rgba(255,255,255,0.03); border: 1px solid rgba(163,230,53,0.2); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .bulk-head { display: flex; flex-direction: column; gap: 2px; }
+  .bulk-row { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-radius: 8px; }
+  .bulk-row.active { background: rgba(163,230,53,0.06); }
+  .bulk-label { flex: 1; font-size: 12px; }
+  .bulk-inc { width: 20px; height: 20px; border-radius: 5px; border: 1.5px solid rgba(255,255,255,0.22); background: transparent; color: #0b0d08; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
+  .bulk-inc.on { background: var(--accent); border-color: var(--accent); }
+  .bulk-num { width: 90px; background: #101408; border: 1px solid rgba(255,255,255,0.13); border-radius: 8px; padding: 5px 8px; color: #fff; font-size: 12px; }
 </style>

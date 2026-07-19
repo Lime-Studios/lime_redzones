@@ -1,31 +1,36 @@
--- lime_redzones logging bridge
--- Config is stored in Data.settings.logs (persisted to SQL by server.lua).
--- This file exposes Log() and GetLogs(); it reads config via GetLogSettings() from server.lua.
+-- Logging bridge. Entries are written to their own `lime_redzones_logs` table
+-- so they survive restarts and can be paged/searched from the tablet.
+-- Retention (auto-wipe) and manual wipes are configured in Data.settings.logs.
 
-local LogStore = {}   -- category -> { entries... } newest first
+local ready = false
 
 local function cfg()
     if GetLogSettings then return GetLogSettings() end
-    return { enabled = true, categories = {}, webhooks = {}, leaderboardPost = {} }
+    return { enabled = true, categories = {}, webhooks = {}, leaderboardPost = {}, retentionDays = 14 }
 end
 
-local function memCap()
-    return (Config and Config.LogKeepInMemory) or 200
-end
-
-local function pushMemory(category, entry)
-    LogStore[category] = LogStore[category] or {}
-    table.insert(LogStore[category], 1, entry)
-    local cap = memCap()
-    while #LogStore[category] > cap do table.remove(LogStore[category]) end
-end
+CreateThread(function()
+    while GetResourceState('oxmysql') ~= 'started' do Wait(250) end
+    exports.oxmysql:query([[
+        CREATE TABLE IF NOT EXISTS lime_redzones_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            category VARCHAR(32) NOT NULL,
+            title VARCHAR(120) NOT NULL,
+            description TEXT,
+            actor VARCHAR(120),
+            fields TEXT,
+            created_at INT NOT NULL,
+            INDEX idx_cat_time (category, created_at)
+        )
+    ]], {}, function() ready = true end)
+end)
 
 local function sendWebhook(url, title, description, fields)
     if not url or url == '' then return end
     local embed = { {
         title = title,
         description = description,
-        color = (Config and Config.LogColor) or 10672181,
+        color = (Config and Config.LogColor) or 10930928,
         fields = fields,
         footer = { text = 'lime_redzones' },
         timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ'),
@@ -35,48 +40,77 @@ local function sendWebhook(url, title, description, fields)
         { ['Content-Type'] = 'application/json' })
 end
 
--- category: 'admin' | 'kills' | 'revives' | 'leaderboardRz' | 'leaderboardGlobal'
-local function webhookFor(category)
-    return (cfg().webhooks or {})[category]
-end
-
-function Log(category, title, description, fields)
+-- actor is optional; it's shown as its own column in the tablet.
+function Log(category, title, description, fields, actor)
     local c = cfg()
     if c.enabled == false then return end
+    if (c.categories or {})[category] == false then return end
 
-    local isLeaderboard = (category == 'leaderboardRz' or category == 'leaderboardGlobal')
-    if not isLeaderboard and (c.categories or {})[category] == false then return end
-
-    if not isLeaderboard then
-        pushMemory(category, {
-            category = category, title = title,
-            description = description or '', fields = fields, time = os.time(),
-        })
+    if ready then
+        exports.oxmysql:insert(
+            'INSERT INTO lime_redzones_logs (category, title, description, actor, fields, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            { category, tostring(title):sub(1, 120), tostring(description or ''), actor and tostring(actor):sub(1, 120) or nil,
+              fields and json.encode(fields) or nil, os.time() }
+        )
     end
 
-    sendWebhook(webhookFor(category), title, description, fields)
+    sendWebhook((c.webhooks or {})[category], title, description, fields)
 end
 
-function GetLogs(category, limit)
-    limit = limit or 50
-    local out, src = {}, LogStore[category] or {}
-    for i = 1, math.min(limit, #src) do out[i] = src[i] end
-    return out
+-- Paged fetch. Returns newest first plus a total so the UI can page.
+function GetLogsPaged(category, page, perPage, search, done)
+    if not ready then done({ entries = {}, total = 0 }) return end
+    page = math.max(1, tonumber(page) or 1)
+    perPage = math.max(5, math.min(50, tonumber(perPage) or 10))
+    local offset = (page - 1) * perPage
+
+    local where, args = 'category = ?', { category }
+    if search and search ~= '' then
+        where = where .. ' AND (title LIKE ? OR description LIKE ? OR actor LIKE ?)'
+        local like = '%' .. search .. '%'
+        args[#args+1] = like; args[#args+1] = like; args[#args+1] = like
+    end
+
+    exports.oxmysql:scalar('SELECT COUNT(*) FROM lime_redzones_logs WHERE ' .. where, args, function(total)
+        local qArgs = {}
+        for i, v in ipairs(args) do qArgs[i] = v end
+        qArgs[#qArgs+1] = perPage
+        qArgs[#qArgs+1] = offset
+        exports.oxmysql:query(
+            'SELECT id, category, title, description, actor, fields, created_at FROM lime_redzones_logs WHERE ' .. where ..
+            ' ORDER BY id DESC LIMIT ? OFFSET ?', qArgs,
+            function(rows)
+                local out = {}
+                for i, r in ipairs(rows or {}) do
+                    local f = nil
+                    if r.fields then local ok, parsed = pcall(json.decode, r.fields) if ok then f = parsed end end
+                    out[i] = { id = r.id, category = r.category, title = r.title,
+                               description = r.description, actor = r.actor, fields = f, time = r.created_at }
+                end
+                done({ entries = out, total = tonumber(total) or 0 })
+            end)
+    end)
 end
 
--- Public leaderboard auto-post timer.
+function WipeLogs(category, done)
+    if not ready then if done then done(0) end return end
+    if category and category ~= 'all' then
+        exports.oxmysql:update('DELETE FROM lime_redzones_logs WHERE category = ?', { category },
+            function(affected) if done then done(affected or 0) end end)
+    else
+        exports.oxmysql:update('DELETE FROM lime_redzones_logs', {},
+            function(affected) if done then done(affected or 0) end end)
+    end
+end
+
+-- Retention sweep: drop anything older than retentionDays. 0 = keep forever.
 CreateThread(function()
-    local lastPost = 0
     while true do
-        Wait(30000)
-        local c = cfg()
-        local lp = c.leaderboardPost
-        if c.enabled ~= false and lp and lp.enabled and lp.interval and lp.interval > 0 then
-            local now = os.time()
-            if now - lastPost >= (lp.interval * 60) then
-                lastPost = now
-                if _G.PostLeaderboardLog then _G.PostLeaderboardLog(lp.board or 'redzone', lp.top or 10) end
-            end
+        Wait(3600000)
+        local days = tonumber(cfg().retentionDays) or 0
+        if ready and days > 0 then
+            exports.oxmysql:update('DELETE FROM lime_redzones_logs WHERE created_at < ?',
+                { os.time() - (days * 86400) })
         end
     end
 end)

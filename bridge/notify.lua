@@ -1,68 +1,81 @@
 local notifyWarned = false
-local limeFn = nil
 
-local function s(v)
-    if type(v) == 'string' then return v end
-    if type(v) == 'number' then return tostring(v) end
-    if v == nil then return '' end
-    return tostring(v)
+-- GTA text codes (~g~, ~s~, ~n~ …) are only valid in native feed text; in a
+-- NUI notification they render as literal junk. Strip them, and normalise
+-- whatever we were handed into a clean, capped string.
+local function sanitize(message)
+    message = tostring(message or '')
+    message = message:gsub('~[%a]~', ''):gsub('~n~', ' ')
+    message = message:gsub('%s+', ' '):match('^%s*(.-)%s*$') or ''
+    if #message > 200 then message = message:sub(1, 197) .. '…' end
+    return message
 end
 
-local function tryLime(message, ntype, duration)
-    message, ntype, duration = s(message), s(ntype), tonumber(duration) or 4000
+-- Each notify resource has its own set of valid type names; an unknown type
+-- falls back to that resource's default styling (often unthemed/black).
+local TYPE_MAP = {
+    ox      = { info = 'inform',  success = 'success', error = 'error', warning = 'warning' },
+    okok    = { info = 'info',    success = 'success', error = 'error', warning = 'warning' },
+    mythic  = { info = 'inform',  success = 'success', error = 'error', warning = 'alert'   },
+    qb      = { info = 'primary', success = 'success', error = 'error', warning = 'warning' },
+}
 
-    local candidates = {
-        function() exports.lime_notify:Notify(message, ntype, duration) end,
-        function() exports.lime_notify:SendNotify(message, ntype, duration) end,
-        function() exports.lime_notify:notify({ title = 'Redzone', description = message, message = message, type = ntype, duration = duration }) end,
-        function() exports.lime_notify:Notify({ title = 'Redzone', description = message, message = message, type = ntype, duration = duration }) end,
-        function() exports.lime_notify:SendNotify({ title = 'Redzone', description = message, message = message, type = ntype, duration = duration }) end,
-        function() exports.lime_notify:ShowNotification(message, ntype, duration) end,
-        function() TriggerEvent('lime_notify:notify', { message = message, description = message, type = ntype, duration = duration }) end,
-    }
-
-    if limeFn then
-        if pcall(candidates[limeFn]) then return true end
-        limeFn = nil
-    end
-    for i, fn in ipairs(candidates) do
-        if pcall(fn) then limeFn = i return true end
-    end
-    return false
+local function norm(ntype)
+    ntype = tostring(ntype or 'info'):lower()
+    if ntype ~= 'success' and ntype ~= 'error' and ntype ~= 'warning' then ntype = 'info' end
+    return ntype
 end
 
 function Notify(message, ntype, duration)
-    message  = s(message)
+    message = sanitize(message)
     if message == '' then return end
-    ntype    = (ntype ~= nil and ntype ~= '') and s(ntype) or 'info'
-    duration = tonumber(duration) or 4000
+    ntype = norm(ntype)
+    duration = math.max(1500, math.min(15000, tonumber(duration) or 5000))
 
     if GetResourceState('ox_lib') == 'started' then
-        local t = ntype == 'info' and 'inform' or ntype
-        if pcall(function() lib.notify({ title = 'Redzone', description = message, type = t, duration = duration }) end) then return end
+        local ok = pcall(function()
+            exports.ox_lib:notify({ title = 'Lime Zones', description = message, type = TYPE_MAP.ox[ntype], duration = duration })
+        end)
+        if ok then return end
     end
-    if GetResourceState('lime_notify') == 'started' and tryLime(message, ntype, duration) then return end
+
+    if GetResourceState('lime_notify') == 'started' then
+        local ok = pcall(function() exports.lime_notify:Notify(message, ntype, duration) end)
+        if ok then return end
+    end
+
+    -- Community Bridge covers a long tail of notify resources. It sits after
+    -- the explicit handlers above so lime_notify (and ox_lib) keep priority.
+    if CB and CB.active then
+        local ok = pcall(function() exports.community_bridge:SendNotify(message, ntype, duration) end)
+        if ok then return end
+    end
+
     if GetResourceState('okokNotify') == 'started' then
-        if pcall(function() exports['okokNotify']:Alert('Redzone', message, duration, ntype) end) then return end
+        TriggerEvent('okokNotify:Alert', 'Lime Zones', message, duration, TYPE_MAP.okok[ntype])
+        return
     end
+
     if GetResourceState('mythic_notify') == 'started' then
-        local t = ntype == 'info' and 'inform' or ntype
-        if pcall(function() exports['mythic_notify']:DoHudText(t, message) end) then return end
+        exports.mythic_notify:SendAlert(TYPE_MAP.mythic[ntype], message, duration)
+        return
     end
+
     if GetResourceState('qbx_core') == 'started' then
-        if pcall(function() exports.qbx_core:Notify(message, ntype == 'info' and 'primary' or ntype, duration) end) then return end
+        exports.qbx_core:Notify(message, TYPE_MAP.qb[ntype], duration)
+        return
     end
+
     if GetResourceState('qb-core') == 'started' then
-        if pcall(function() exports['qb-core']:GetCoreObject().Functions.Notify(message, ntype == 'info' and 'primary' or ntype, duration) end) then return end
+        TriggerEvent('QBCore:Notify', message, TYPE_MAP.qb[ntype], duration)
+        return
     end
+
     if GetResourceState('es_extended') == 'started' then
         TriggerEvent('esx:showNotification', message)
         return
     end
 
-    -- No external notification resource found. This script uses external
-    -- notifications only (no built-in/native notify). Warn once so the
-    -- server owner knows to install/start a supported notify resource.
     if not notifyWarned then
         notifyWarned = true
         print('^3[lime_redzones] No supported notification resource detected (ox_lib, lime_notify, okokNotify, mythic_notify, qbx_core, qb-core, es_extended). Notifications will not be shown.^0')
