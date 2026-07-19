@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'lime'
 description 'lime_redzones — in-game redzone & safe zone creator'
-version '2.0.0'
+version '1.1.0'
 
 ui_page 'web/index.html'
 
@@ -40,6 +40,8 @@ server_scripts {
     'bridge/logs.lua',
     'bridge/banking.lua',
     'server/server.lua',
+    '_versioncheck.lua',
+
 }
 
 escrow_ignore {
