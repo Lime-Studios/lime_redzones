@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<CMapTypes>
+  <extensions/>
+  <archetypes>
+    <Item type="CBaseArchetypeDef">
+      <lodDist value="199.00000000"/>
+      <flags value="537002016"/>
+      <specialAttribute value="0"/>
+      <bbMin x="-0.08909700" y="-0.00554100" z="-0.11940800"/>
+      <bbMax x="0.08991500" y="0.00592700" z="0.11940800"/>
+      <bsCentre x="0.00040900" y="0.00019300" z="0.00000000"/>
+      <bsRadius value="0.14934010"/>
+      <hdTextureDist value="5.00000000"/>
+      <name>limeredzones_prop</name>
+      <textureDictionary>limeredzones_prop</textureDictionary>
+      <clipDictionary/>
+      <drawableDictionary/>
+      <physicsDictionary>limeredzones_prop</physicsDictionary>
+      <assetType>ASSET_TYPE_DRAWABLE</assetType>
+      <assetName>limeredzones_prop</assetName>
+      <extensions/>
+    </Item>
+  </archetypes>
+  <name/>
+  <dependencies/>
+  <compositeEntityTypes/>
+</CMapTypes>

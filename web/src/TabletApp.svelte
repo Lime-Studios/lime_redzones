@@ -5,7 +5,7 @@
         zones = {}, gangs = {}, settings = {}, personalColor = null,
         lbData = { players: [], gangs: [], globalPlayers: [], totals: {} },
         placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logTotal = 0, logConfig = null, prizeHistory = [], firstTime = false, stats = {},
-        hudTheme = 'lime', hudPreset = 'top', hudScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit',
+        hudTheme = 'lime', hudPreset = 'top', hudScale = 1, tabletScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit',
         onclose } = $props()
 
   const O = $derived(options ?? {})
@@ -33,7 +33,32 @@
   let logPerPage = $state(10)
   let logSearch = $state('')
   let logView = $state('view')
-  let refreshSpin = $state(false)   // 'view' | 'settings' — entries first, config on its own page
+  let refreshSpin = $state(false)
+  // Tablet resize: drag the corner grip, whole UI scales live, persists via KVP.
+  let tScale = $state(1)
+  let tScaleInit = $state(false)
+  $effect(() => { if (display && !tScaleInit) { tScale = Math.min(1.5, Math.max(0.7, +tabletScale || 1)); tScaleInit = true } })
+  let resizing = $state(false)
+  let rsStart = { x: 0, y: 0, scale: 1 }
+  function resizeStart(e) {
+    resizing = true
+    rsStart = { x: e.clientX, y: e.clientY, scale: tScale }
+    window.addEventListener('pointermove', resizeMove)
+    window.addEventListener('pointerup', resizeEnd, { once: true })
+    e.preventDefault()
+  }
+  function resizeMove(e) {
+    if (!resizing) return
+    // Dragging away from centre grows, toward it shrinks. 425 = half the base
+    // width, so a corner-to-corner drag maps ~1:1 onto the scale.
+    const d = ((e.clientX - rsStart.x) + (e.clientY - rsStart.y)) / 2
+    tScale = Math.min(1.5, Math.max(0.7, rsStart.scale + d / 425))
+  }
+  function resizeEnd() {
+    resizing = false
+    window.removeEventListener('pointermove', resizeMove)
+    post('saveTabletScale', { scale: tScale })
+  }   // 'view' | 'settings' — entries first, config on its own page
   let logSearchTimer = null
   const logPages = $derived(Math.max(1, Math.ceil(logTotal / logPerPage)))
   function loadLogs(page = logPage) {
@@ -179,7 +204,10 @@
     post('bulkUpdateZones', { ids: [...bulkSel], patch: bulkPatch })
     bulkExit()
   }
-  const tpZones = $derived(Object.values(zones ?? {}).filter(z => z.enabled !== false && z.type !== 'safezone' && z.allowTeleport === true))
+  let tpFilter = $state('all')  // 'all' | 'redzone' | 'safezone'
+  const tpZones = $derived(Object.values(zones ?? {})
+    .filter(z => z.enabled !== false && z.allowTeleport === true)
+    .filter(z => tpFilter === 'all' || (tpFilter === 'safezone' ? z.type === 'safezone' : z.type !== 'safezone')))
   const gangList = $derived(Object.entries(gangs ?? {}).map(([name, g]) => ({ name, label: g.label })))
   const adminList = $derived(settings?.admins ?? [])
   const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
@@ -323,6 +351,7 @@
     id: null, type: 'safezone', name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
     colorHex: '#57F187', colorA: 60, blipSprite: 60, blipColor: 2,
     invincible: true, disableWeapons: true, weaponMode: 'holster', phaseThrough: true, speedLimit: 0, deleteVehicleOnEntry: false,
+    allowTeleport: false, teleportCost: 0, teleportCostSource: 'cash', tpPoints: [],
     poly: [], polyMinZ: null, polyMaxZ: null,
     showBlip: true, showRadiusBlip: true, enabled: true,
   }) : ({
@@ -344,6 +373,8 @@
       editing.rewardItems ??= []; editing.streakRewards ??= []; editing.exits ??= []; editing.tpPoints ??= []
     }
     editing.poly ??= []
+    editing.tpPoints ??= []
+    if (editing.type !== 'safezone') editing.allowedWeapons ??= []
   }
   async function grabPos(target) {
     const pos = await post('getMyPosition')
@@ -352,6 +383,7 @@
       editing.coords = pos
     } else if (target === 'tp') {
       editing.tpPoints ??= []
+    if (editing.type !== 'safezone') editing.allowedWeapons ??= []
       if (editing.tpPoints.length < 5) editing.tpPoints.push(pos)
     } else if (editing.exits.length < 5) {
       editing.exits.push(pos)
@@ -400,7 +432,10 @@
 {#if display}
 <div class="blocker" role="button" tabindex="-1" onclick={onclose} onkeydown={() => {}}></div>
 
-<div class="tablet">
+<div class="tablet" style:transform={`scale(${tScale})`}>
+  <button class="resize-grip" onpointerdown={resizeStart} title="Drag to resize" aria-label="Resize tablet">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M21 15v6h-6M21 21L13 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
   <div class="statusbar">
     <span class="sb-left">
       {#if canAdmin}
@@ -503,17 +538,23 @@
 
       {:else if effectiveTab === 'teleport'}
         <div class="page-head"><h1>Teleport</h1></div>
-        <p class="sub">Jump straight to a redzone. Only zones your staff have opened up appear here.</p>
+        <p class="sub">Jump straight to a zone. Only zones your staff have opened up appear here.</p>
+
+        <div class="seg" style="margin-bottom:10px">
+          <button class:on={tpFilter === 'all'} onclick={() => tpFilter = 'all'}>All</button>
+          <button class:on={tpFilter === 'redzone'} onclick={() => tpFilter = 'redzone'}>Redzones</button>
+          <button class:on={tpFilter === 'safezone'} onclick={() => tpFilter = 'safezone'}>Greenzones</button>
+        </div>
 
         {#if tpZones.length === 0}
-          <div class="empty">No redzones are open for teleporting right now.</div>
+          <div class="empty">No zones are open for teleporting{tpFilter !== 'all' ? ' in this category' : ''} right now.</div>
         {:else}
           <div class="tp-grid">
             {#each tpZones as z (z.id)}
               <div class="tp-card">
                 <span class="tp-dot" style:background={z.colorHex ?? '#FF0000'}></span>
                 <div class="tp-info">
-                  <b>{z.name}</b>
+                  <b>{z.name} <span class="ztype" class:safe={z.type === 'safezone'}>{z.type === 'safezone' ? 'SAFE' : 'RZ'}</span></b>
                   <span class="tp-meta">{z.radius}m radius{#if (z.teleportCost ?? 0) > 0} · ${z.teleportCost} {z.teleportCostSource === 'bank' ? 'bank' : 'cash'}{:else} · Free{/if}</span>
                 </div>
                 <button class="btn go" class:confirming={pendingConfirm === 'tp:' + z.id}
@@ -1121,7 +1162,7 @@
           <span class="dim grow">Custom shape — {editing.poly.length} corners</span>
           <button class="ib red" onclick={() => editing.poly = []} title="Clear shape">✕</button>
         </div>
-        <p class="hint">The radius below is still used for the map blip and distance checks, but the outline decides who's inside.</p>
+        <p class="hint">The outline decides everything — centre and radius are calculated from it automatically.</p>
       {:else}
         <p class="hint">Circular by default. Draw a custom outline to fit streets, buildings or an irregular area.</p>
       {/if}
@@ -1145,8 +1186,12 @@
           placeholder={'Paste points: [{"x":0,"y":0,"z":30}, …] — or draw in world above'}></textarea>
       </label>
 
-      <div class="f"><span>Coordinates</span><div class="frow"><input type="number" step="0.01" bind:value={editing.coords.x} /><input type="number" step="0.01" bind:value={editing.coords.y} /><input type="number" step="0.01" bind:value={editing.coords.z} /><button class="ib lime" onclick={() => grabPos('coords')} title="Use my position"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></div></div>
-      <label class="f"><span>Radius <em>{editing.radius}m</em></span><input class="track" type="range" min="10" max="300" bind:value={editing.radius} /></label>
+      {#if (editing.poly?.length ?? 0) >= 3}
+        <p class="hint auto-note">📐 Centre and radius are worked out automatically from your drawn shape — nothing to set here.</p>
+      {:else}
+        <div class="f"><span>Coordinates</span><div class="frow"><input type="number" step="0.01" bind:value={editing.coords.x} /><input type="number" step="0.01" bind:value={editing.coords.y} /><input type="number" step="0.01" bind:value={editing.coords.z} /><button class="ib lime" onclick={() => grabPos('coords')} title="Use my position"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button></div></div>
+        <label class="f"><span>Radius <em>{editing.radius}m</em></span><input class="track" type="range" min="10" max="300" bind:value={editing.radius} /></label>
+      {/if}
       <div class="f"><span>{isSafe ? 'Zone Colour' : 'Zone Colour (Global)'} <em>{editing.colorHex}</em></span><div class="frow"><input class="hexfield" bind:value={editing.colorHex} maxlength="7" spellcheck="false" /><input class="track grow" type="range" min="0" max="255" bind:value={editing.colorA} title="Opacity" /><span class="zdot big" style:background={editing.colorHex}></span></div></div>
 
       {#if !isSafe}
@@ -1197,7 +1242,20 @@
       <div class="frow between"><div><b>Delete vehicles on entry</b><p class="hint">Cars are removed instantly when they drive into this zone.</p></div><button class="sw" class:on={editing.deleteVehicleOnEntry !== false} onclick={() => editing.deleteVehicleOnEntry = editing.deleteVehicleOnEntry === false ? true : false} aria-label="Toggle"><i></i></button></div>
       <div class="frow between"><div><b>Infinite stamina</b><p class="hint">Players never run out of breath while inside.</p></div><button class="sw" class:on={editing.infiniteStamina === true} onclick={() => editing.infiniteStamina = !editing.infiniteStamina} aria-label="Toggle"><i></i></button></div>
       <div class="frow between"><div><b>Block shooting from outside</b><p class="hint">Players outside can't fire in — stops perimeter camping.</p></div><button class="sw" class:on={editing.blockOutsideShooting === true} onclick={() => editing.blockOutsideShooting = !editing.blockOutsideShooting} aria-label="Toggle"><i></i></button></div>
-      <div class="frow between"><div><b>Allow teleport here</b><p class="hint">Lists this zone on the player Teleport tab.</p></div><button class="sw" class:on={editing.allowTeleport === true} onclick={() => editing.allowTeleport = !editing.allowTeleport} aria-label="Toggle"><i></i></button></div>
+
+      <label class="f"><span>Locked weapons <em>{(editing.allowedWeapons?.length ?? 0) > 0 ? 'only listed weapons usable' : 'all weapons allowed'}</em></span>
+        <div class="frow wrapchips">
+          {#each editing.allowedWeapons ?? [] as w, wi}
+            <span class="wchip">{w}<button class="wchip-x" onclick={() => editing.allowedWeapons.splice(wi, 1)}>✕</button></span>
+          {/each}
+          <input class="wchip-in" placeholder="weapon_pistol ⏎" spellcheck="false"
+            onkeydown={(e) => { if (e.key === 'Enter' && e.target.value.trim()) { editing.allowedWeapons ??= []; const v = e.target.value.trim().toLowerCase().replace(/\s+/g,''); if (!editing.allowedWeapons.includes(v) && editing.allowedWeapons.length < 40) editing.allowedWeapons.push(v); e.target.value = '' } }} />
+        </div>
+      </label>
+      <p class="hint">Type weapon names (e.g. weapon_pistol, weapon_carbinerifle) and press Enter. Leave empty for no restriction. Anything else gets holstered inside this zone.</p>
+      {/if}
+
+      <div class="frow between"><div><b>Allow teleport here</b><p class="hint">Lists this zone on the player Teleport tab — works for redzones and greenzones.</p></div><button class="sw" class:on={editing.allowTeleport === true} onclick={() => editing.allowTeleport = !editing.allowTeleport} aria-label="Toggle"><i></i></button></div>
       {#if editing.allowTeleport}
         <div class="frow">
           <label class="f grow"><span>Teleport cost</span><input type="number" min="0" bind:value={editing.teleportCost} /></label>
@@ -1223,7 +1281,6 @@
           </div>
         {/if}
         <p class="hint">Players arrive at a random point from this list, facing the direction you were. Leave empty to drop them at the zone centre.</p>
-      {/if}
       {/if}
 
       {#if isSafe}
@@ -1517,4 +1574,15 @@
   .bulk-inc { width: 20px; height: 20px; border-radius: 5px; border: 1.5px solid rgba(255,255,255,0.22); background: transparent; color: #0b0d08; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
   .bulk-inc.on { background: var(--accent); border-color: var(--accent); }
   .bulk-num { width: 90px; background: #101408; border: 1px solid rgba(255,255,255,0.13); border-radius: 8px; padding: 5px 8px; color: #fff; font-size: 12px; }
+
+  .tablet { transform-origin: center center; }
+  .resize-grip { position: absolute; right: 6px; bottom: 6px; z-index: 30; width: 26px; height: 26px; border-radius: 8px; border: none; background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.45); display: flex; align-items: center; justify-content: center; cursor: nwse-resize; touch-action: none; }
+  .resize-grip:hover { color: var(--accent); background: rgba(163,230,53,0.12); }
+
+  .auto-note { background: rgba(163,230,53,0.07); border: 1px solid rgba(163,230,53,0.18); border-radius: 9px; padding: 8px 11px; color: rgba(255,255,255,0.75); }
+  .wrapchips { flex-wrap: wrap; gap: 5px; align-items: center; }
+  .wchip { display: inline-flex; align-items: center; gap: 4px; background: rgba(163,230,53,0.12); border: 1px solid rgba(163,230,53,0.3); color: var(--accent); border-radius: 99px; padding: 3px 5px 3px 10px; font-size: 11px; font-weight: 800; }
+  .wchip-x { background: none; border: none; color: inherit; cursor: pointer; font-size: 10px; padding: 1px 4px; opacity: 0.7; }
+  .wchip-x:hover { opacity: 1; }
+  .wchip-in { flex: 1; min-width: 130px; background: #101408; border: 1px solid rgba(255,255,255,0.13); border-radius: 8px; padding: 6px 9px; color: #fff; font-size: 11.5px; }
 </style>

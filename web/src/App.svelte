@@ -13,7 +13,7 @@
     display: false, mode: 'player', tab: 'rzleaderboard',
     zones: {}, gangs: {}, settings: {}, personalColor: null,
     lbData: { players: [], gangs: [], globalPlayers: [], totals: {} },
-    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
+    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, tabletScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
   })
   let killcam = $state({ display: false, killer: '', id: 0, theme: 'lime' })
   let safezone = $state({ display: false, name: '', speedLimit: 0 })
@@ -79,6 +79,7 @@
       if (d.hudTheme)  { hud.theme = d.hudTheme; killcam.theme = d.hudTheme; tablet.hudTheme = d.hudTheme }
       if (d.hudPreset) { hud.preset = d.hudPreset; tablet.hudPreset = d.hudPreset }
       if (d.hudScale)  { hud.scale = +d.hudScale; tablet.hudScale = +d.hudScale }
+      if (d.tabletScale) tablet.tabletScale = +d.tabletScale
       if (d.killfeedPos) kfPos = d.killfeedPos
       if (d.killfeedScale) { kfScale = +d.killfeedScale; tablet.killfeedScale = +d.killfeedScale }
       if (d.killfeedTheme) { tablet.killfeedTheme = d.killfeedTheme; kfTheme = resolveTheme(d.killfeedTheme, d.hudTheme || hud.theme) }

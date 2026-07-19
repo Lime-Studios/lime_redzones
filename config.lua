@@ -30,6 +30,15 @@ Config.TeleportNpcModels = {
     'a_m_y_business_01', 'a_m_y_soucent_01', 'a_f_y_business_02', 'a_m_m_business_01',
 }
 
+-- Tablet prop shown in-hand while the panel is open.
+-- The base-game 'prop_cs_tablet' is used by default because its textures are
+-- guaranteed present. A custom streamed model ('prop_cs_tablet_ls') ships in
+-- stream/ — set Config.TabletProp to it once you've confirmed its .ytd binds
+-- (if the custom model shows up invisible/untextured, its texture dictionary
+-- isn't embedded correctly). The fallback covers a failed custom load.
+Config.TabletProp         = 'prop_cs_tablet'
+Config.TabletPropFallback = 'prop_cs_tablet'
+
 -- Weapon hash -> readable label, used in kill feed / logs.
 Config.WeaponNames = {
     [453432689]  = 'Pistol',          [1593441988]  = 'Combat Pistol',

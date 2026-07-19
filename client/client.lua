@@ -65,13 +65,20 @@ local function DrawPolyWalls(z)
     for i = 1, n do
         local p1 = z.poly[i]
         local p2 = z.poly[i % n + 1]
+        -- Each wall = a quad = two triangles. DrawPoly is SINGLE-SIDED (only
+        -- the side whose vertices wind counter-clockwise toward the camera is
+        -- drawn), so every triangle is drawn in BOTH windings. Without the
+        -- reversed copies, walls facing away from the camera vanish — which is
+        -- why part of the box wasn't showing.
+        -- Triangle 1: bottom-left, bottom-right, top-right
         DrawPoly(p1.x, p1.y, baseZ, p2.x, p2.y, baseZ, p2.x, p2.y, topZ, r, g, b, a)
+        DrawPoly(p2.x, p2.y, topZ,  p2.x, p2.y, baseZ, p1.x, p1.y, baseZ, r, g, b, a) -- reverse
+        -- Triangle 2: bottom-left, top-right, top-left
         DrawPoly(p1.x, p1.y, baseZ, p2.x, p2.y, topZ, p1.x, p1.y, topZ, r, g, b, a)
-        DrawPoly(p2.x, p2.y, baseZ, p1.x, p1.y, baseZ, p1.x, p1.y, topZ, r, g, b, a)
-        DrawPoly(p2.x, p2.y, topZ,  p2.x, p2.y, baseZ, p1.x, p1.y, topZ, r, g, b, a)
-        -- Soft base edge only — enough to read the boundary at ground level
-        -- without the bright wireframe look.
+        DrawPoly(p1.x, p1.y, topZ,  p2.x, p2.y, topZ, p1.x, p1.y, baseZ, r, g, b, a) -- reverse
+        -- Soft base + top edge so the boundary reads without a bright wireframe.
         DrawLine(p1.x, p1.y, baseZ, p2.x, p2.y, baseZ, r, g, b, edgeA)
+        DrawLine(p1.x, p1.y, topZ,  p2.x, p2.y, topZ,  r, g, b, math.floor(edgeA * 0.6))
     end
 end
 
@@ -244,6 +251,7 @@ end
 -- would quietly return.
 local placing = nil
 local tabletProp = nil  -- attached tablet prop while the panel is open
+local lastWeapNotify = 0  -- throttles the weapon-lock notification
 local tabletAnimGen = 0 -- bumps on every open/close so a slow loader can tell
                         -- its request was superseded and must not spawn a prop
 
@@ -327,6 +335,17 @@ RegisterNetEvent('lime_redzones:client:syncZones', function(zones, renderDist)
         z.vec = vector3(z.coords.x, z.coords.y, z.coords.z)
         z._r, z._g, z._b = HexToRGB(z.colorHex or '#FF0000')
         z._a = z.colorA or 80
+        -- Weapon lock: pre-hash the allowed names once. Unarmed is always
+        -- permitted so the enforcement itself can't fight the player.
+        if type(z.allowedWeapons) == 'table' and #z.allowedWeapons > 0 then
+            local set = { [`WEAPON_UNARMED`] = true }
+            for _, w in ipairs(z.allowedWeapons) do
+                set[GetHashKey(w)] = true
+            end
+            z._weapSet = set
+        else
+            z._weapSet = nil
+        end
     end
     BuildBlips()
 end)
@@ -354,8 +373,6 @@ local function UpdateHUD()
     })
 end
 
--- Tablet-in-hand animation while the panel is open. Optional (Options tab),
--- skipped when dead or in a vehicle where the pose looks broken.
 local TABLET_DICT = 'amb@code_human_in_bus_passenger_idles@female@tablet@base'
 
 local function clearTabletProp()
@@ -368,7 +385,6 @@ end
 
 local function SetTabletAnim(on)
     local ped = PlayerPedId()
-    -- Every call invalidates any in-flight loader from a previous call.
     tabletAnimGen = tabletAnimGen + 1
     local myGen = tabletAnimGen
 
@@ -377,43 +393,70 @@ local function SetTabletAnim(on)
         if IsEntityDead(ped) or IsPedInAnyVehicle(ped, true) then return end
         CreateThread(function()
             RequestAnimDict(TABLET_DICT)
-            local model = `prop_cs_tablet`
+            
+            local wantName = 'limeredzones_prop'
+            local model = GetHashKey(wantName)
+            local isFallback = false
+
             RequestModel(model)
+            
             local tries = 0
-            while (not HasAnimDictLoaded(TABLET_DICT) or not HasModelLoaded(model)) and tries < 100 do
-                Wait(10); tries = tries + 1
-                -- Superseded by a newer open/close while loading: abort cleanly.
+            while not HasModelLoaded(model) and tries < 300 do
+                Wait(10)
+                tries = tries + 1
                 if myGen ~= tabletAnimGen then
                     SetModelAsNoLongerNeeded(model)
                     return
                 end
             end
-            -- Still the current request and still open?
-            if myGen ~= tabletAnimGen or not tabletOpen
-               or not HasAnimDictLoaded(TABLET_DICT) or not HasModelLoaded(model) then
+
+            if not HasModelLoaded(model) then
+                model = GetHashKey('prop_cs_tablet')
+                isFallback = true
+                RequestModel(model)
+                while not HasModelLoaded(model) do Wait(0) end
+            end
+
+            if myGen ~= tabletAnimGen or not tabletOpen then
                 SetModelAsNoLongerNeeded(model)
                 return
             end
 
             ped = PlayerPedId()
-            -- Flag 50 = upperbody + loop + upperbody-only secondary. Play it as
-            -- a secondary anim task so it layers over movement AND is cleared by
-            -- ClearPedSecondaryTask on close.
+            RequestAnimDict(TABLET_DICT)
+            while not HasAnimDictLoaded(TABLET_DICT) do Wait(0) end
+            
             TaskPlayAnim(ped, TABLET_DICT, 'base', 3.0, 3.0, -1, 50, 0, false, false, false)
 
             clearTabletProp()
-            tabletProp = CreateObject(model, 0.0, 0.0, 0.0, true, true, false)
-            AttachEntityToEntity(tabletProp, ped, GetPedBoneIndex(ped, 28422),
-                -0.05, 0.0, 0.0, 10.0, -25.0, 0.0, true, false, false, false, 2, true)
-            SetModelAsNoLongerNeeded(model)
-
-            -- Final guard: if the panel closed during the two frames above,
-            -- tear the prop and anim back down so nothing is left in-hand.
-            if myGen ~= tabletAnimGen or not tabletOpen then
-                StopAnimTask(ped, TABLET_DICT, 'base', 2.0)
-                ClearPedSecondaryTask(ped)
-                clearTabletProp()
+            
+            local boneCoords = GetPedBoneCoords(ped, 28422, 0.0, 0.0, 0.0)
+            tabletProp = CreateObject(model, boneCoords.x, boneCoords.y, boneCoords.z, true, true, false)
+            
+            while not DoesEntityExist(tabletProp) do Wait(0) end
+            
+            SetEntityCollision(tabletProp, false, false)
+            SetEntityVisible(tabletProp, true, false)
+            SetEntityAlpha(tabletProp, 255, false)
+            ResetEntityAlpha(tabletProp)
+            
+            local bone = GetPedBoneIndex(ped, 28422) -- SKEL_R_Hand
+            
+            local offX, offY, offZ, rotX, rotY, rotZ
+            if isFallback then
+                offX, offY, offZ = 0.0, -0.03, 0.0
+                rotX, rotY, rotZ = 20.0, -90.0, 0.0
+            else
+                -- INTEGRATED YOUR PROVIDED CONFIGURATION SETTINGS
+                offX, offY, offZ = 0.05, -0.005, -0.04
+                rotX, rotY, rotZ = 0.0, 180.0, 0.0
             end
+            
+            AttachEntityToEntity(tabletProp, ped, bone,
+                offX, offY, offZ, rotX, rotY, rotZ, 
+                true, false, false, false, 2, true)
+
+            SetModelAsNoLongerNeeded(model)
         end)
     else
         StopAnimTask(ped, TABLET_DICT, 'base', 2.0)
@@ -447,6 +490,7 @@ local function SetTablet(open, mode, tab, payload)
         hudTheme = GetResourceKvpString('rz_hud_theme') or (Opts.hudDefaultTheme or 'lime'),
         hudPreset = GetResourceKvpString('rz_hud_preset') or (Opts.hudDefaultPreset or 'top'),
         hudScale = tonumber(GetResourceKvpFloat('rz_hud_scale')) or 1.0,
+        tabletScale = tonumber(GetResourceKvpFloat('rz_tablet_scale')) or 1.0,
         killfeedPos = kvpJson('rz_kf_pos'),
         killfeedScale = tonumber(GetResourceKvpFloat('rz_kf_scale')) or 1.0,
         killfeedTheme = GetResourceKvpString('rz_kf_theme') or 'inherit',
@@ -495,6 +539,8 @@ RegisterNetEvent('lime_redzones:client:myStats', function(k, d)
 end)
 
 RegisterNetEvent('lime_redzones:client:killFeed', function(entry)
+    -- Highlight your own kills in the feed.
+    entry.mine = tonumber(entry.killerId) == GetPlayerServerId(PlayerId())
     if type(entry) ~= 'table' then return end
     SendNUIMessage({ type = 'killFeed', entry = entry })
 
@@ -670,6 +716,13 @@ forward('getMyIdentifier', 'lime_redzones:server:myIdentifier')
 
 RegisterNUICallback('toggleZone', function(d, cb) TriggerServerEvent('lime_redzones:server:toggleZone', d.id, d.enabled) cb({}) end)
 forward('saveRanks', 'lime_redzones:server:saveRanks', function(d) return d.ranks end)
+RegisterNUICallback('saveTabletScale', function(d, cb)
+    local sc = tonumber(d.scale) or 1.0
+    if sc < 0.7 then sc = 0.7 elseif sc > 1.5 then sc = 1.5 end
+    SetResourceKvpFloat('rz_tablet_scale', sc)
+    cb({})
+end)
+
 RegisterNUICallback('saveHudTheme', function(d, cb)
     if d.theme then SetResourceKvp('rz_hud_theme', tostring(d.theme)) end
     if d.preset then SetResourceKvp('rz_hud_preset', tostring(d.preset)) end
@@ -856,10 +909,12 @@ end
 
 -- Filled translucent wall between two corners, visible from both sides.
 local function DrawWallQuad(a, b, zLo, zHi, r, g, bl, al)
+    -- Both triangles, both windings — see DrawPolyWalls. Matches the saved-zone
+    -- render so the editor preview looks like the final zone.
     DrawPoly(a.x, a.y, zLo, b.x, b.y, zLo, b.x, b.y, zHi, r, g, bl, al)
+    DrawPoly(b.x, b.y, zHi, b.x, b.y, zLo, a.x, a.y, zLo, r, g, bl, al)
     DrawPoly(a.x, a.y, zLo, b.x, b.y, zHi, a.x, a.y, zHi, r, g, bl, al)
-    DrawPoly(b.x, b.y, zLo, a.x, a.y, zLo, a.x, a.y, zHi, r, g, bl, al)
-    DrawPoly(b.x, b.y, zHi, b.x, b.y, zLo, a.x, a.y, zHi, r, g, bl, al)
+    DrawPoly(a.x, a.y, zHi, b.x, b.y, zHi, a.x, a.y, zLo, r, g, bl, al)
 end
 
 local function RunPolyFreecam(draft)
@@ -925,10 +980,13 @@ local function RunPolyFreecam(draft)
 
         -- Height bounds: X/Z move the top; Shift+X / Shift+Z move the bottom.
         local shift = IsDisabledControlPressed(0, 21)
-        if IsDisabledControlJustPressed(0, 73) then      -- X
+        -- Height bounds: X or ↑ raises, Z or ↓ lowers (Shift = bottom edge).
+        -- The control bar advertised the arrow keys but only X/Z were wired —
+        -- both pairs work now.
+        if IsDisabledControlJustPressed(0, 73) or IsDisabledControlJustPressed(0, 172) then      -- X / Up
             if shift then minZ = math.min(maxZ - 1.0, minZ + 1.0) else maxZ = maxZ + 1.0 end
         end
-        if IsDisabledControlJustPressed(0, 20) then      -- Z
+        if IsDisabledControlJustPressed(0, 20) or IsDisabledControlJustPressed(0, 173) then      -- Z / Down
             if shift then minZ = minZ - 1.0 else maxZ = math.max(minZ + 1.0, maxZ - 1.0) end
         end
 
@@ -1513,6 +1571,20 @@ CreateThread(function()
 
                 if inside and nearest.infiniteStamina then
                     RestorePlayerStamina(PlayerId(), 1.0)
+                end
+
+                -- Weapon lock: only whitelisted weapons usable inside. Checked
+                -- on the same cadence as the other inside logic — swapping to a
+                -- banned gun gets holstered within half a second.
+                if inside and nearest._weapSet then
+                    local cur = GetSelectedPedWeapon(PlayerPedId())
+                    if not nearest._weapSet[cur] then
+                        SetCurrentPedWeapon(PlayerPedId(), `WEAPON_UNARMED`, true)
+                        if (GetGameTimer() - (lastWeapNotify or 0)) > 8000 then
+                            lastWeapNotify = GetGameTimer()
+                            Notify(_U('weapon_locked'), 'error')
+                        end
+                    end
                 end
 
 

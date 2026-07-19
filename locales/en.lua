@@ -29,6 +29,7 @@ Locales['en'] = {
 
     -- Zones
     ['no_vehicles']          = 'Vehicles are not allowed in this redzone.',
+    ['weapon_locked']        = 'That weapon is not allowed in this redzone.',
     ['entered_safezone']     = 'Entered safe zone: %s',
     ['left_safezone']        = 'Left safe zone: %s',
     ['placement_mode']       = 'Placement mode — press E to place a point, G to finish.',

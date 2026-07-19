@@ -4,7 +4,10 @@ lua54 'yes'
 
 author 'lime'
 description 'lime_redzones — in-game redzone & safe zone creator'
-version '1.1.0'
+version '2.0.1'
+
+-- Set to 'true' to silence the startup update check.
+suppress_updates 'false'
 
 ui_page 'web/index.html'
 
@@ -13,6 +16,8 @@ files {
     'web/bundle.js',
     'web/bundle.css',
     'web/fonts/PlusJakartaSans-Variable.woff2',
+    "stream/limeredzones_prop.ytyp",
+    "stream/limeredzones_prop.ydr",
 }
 
 shared_scripts {
@@ -33,6 +38,7 @@ dependencies {
 }
 
 server_scripts {
+    '_versioncheck.lua',
     'bridge/community_sv.lua',
     'bridge/notify_sv.lua',
     'bridge/ambulance_sv.lua',
@@ -40,13 +46,17 @@ server_scripts {
     'bridge/logs.lua',
     'bridge/banking.lua',
     'server/server.lua',
-    '_versioncheck.lua',
-
 }
 
 escrow_ignore {
+    '_versioncheck.lua',
     'config.lua',
     'bridge/*.lua',
     'client/*.lua',
     'server/*.lua',
 }
+
+
+data_file "DLC_ITYP_REQUEST" "limeredzones_prop.ytyp"
+this_is_a_map "yes"
+dependency '/assetpacks'

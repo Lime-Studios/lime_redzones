@@ -693,11 +693,12 @@ RegisterNetEvent('lime_redzones:server:giveKillReward', function(zoneId, victimI
     end
 
     TriggerClientEvent('lime_redzones:client:syncStreak', src, streak)
+    -- Resolved OUTSIDE the feed toggle: the Log below also uses it, and with
+    -- the feed disabled this local didn't exist — nil-format crash that killed
+    -- the rest of the handler.
+    local vId = tonumber(victimId) or 0
+    local victimName = (vId > 0 and GetPlayerName(vId)) and GetPName(vId) or 'Unknown'
     if Data.settings.options.killFeedEnabled ~= false then
-        local vId = tonumber(victimId) or 0
-        -- GetPName falls back to the raw player name, so this only shows
-        -- "Unknown" if the client genuinely couldn't resolve the victim.
-        local victimName = (vId > 0 and GetPlayerName(vId)) and GetPName(vId) or 'Unknown'
         TriggerClientEvent('lime_redzones:client:killFeed', -1, {
             killer = GetPName(src), killerId = src,
             victim = victimName, victimId = vId,
@@ -855,7 +856,7 @@ RegisterNetEvent('lime_redzones:server:teleportToZone', function(zoneId)
     end
 
     local zone = Data.zones[tostring(zoneId)]
-    if not zone or not zone.enabled or zone.type == 'safezone' then return end
+    if not zone or not zone.enabled then return end
     if zone.allowTeleport ~= true then
         NotifySv(src, _U('teleport_disabled'), 'error')
         return
@@ -1057,6 +1058,25 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
     -- Fewer than 3 points can't enclose an area — discard.
     if #poly < 3 then poly = {} end
 
+    -- A drawn shape defines the zone: derive the centre (centroid) and a
+    -- bounding radius from it automatically. Zones used to sit at whatever
+    -- coords the editor happened to hold (often 0,0,0), so a freshly drawn
+    -- zone never rendered, never detected entry — and dying inside one never
+    -- triggered a revive.
+    if #poly >= 3 then
+        local cx, cy, cz, n = 0.0, 0.0, 0.0, #poly
+        for _, p in ipairs(poly) do cx, cy = cx + p.x, cy + p.y end
+        cx, cy = cx / n, cy / n
+        cz = tonumber(zone.polyMinZ) or (type(zone.coords) == 'table' and tonumber(zone.coords.z)) or 30.0
+        local maxR = 0.0
+        for _, p in ipairs(poly) do
+            local d = ((p.x - cx)^2 + (p.y - cy)^2) ^ 0.5
+            if d > maxR then maxR = d end
+        end
+        zone.coords = { x = cx, y = cy, z = cz }
+        zone.radius = math.max(10.0, math.ceil(maxR + 5.0))
+    end
+
     local tpPoints = {}
     if type(zone.tpPoints) == 'table' then
         for i = 1, math.min(5, #zone.tpPoints) do
@@ -1115,6 +1135,12 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
         -- Safe zones default to KEEPING vehicles (players park here); only
         -- delete when explicitly enabled.
         base.deleteVehicleOnEntry = zone.deleteVehicleOnEntry == true
+        -- Teleportable greenzones: same paid flow and arrival points as
+        -- redzones, listed on the player Teleport tab when enabled.
+        base.tpPoints             = tpPoints
+        base.allowTeleport        = zone.allowTeleport == true
+        base.teleportCost         = math.max(0, math.floor(tonumber(zone.teleportCost) or 0))
+        base.teleportCostSource   = zone.teleportCostSource == 'bank' and 'bank' or 'cash'
         -- weaponMode: 'holster' (force unarmed + block fire), 'blockfire'
         -- (draw allowed, firing blocked), or 'off'. disableWeapons kept in
         -- sync so any old code / legacy reads still behave.
