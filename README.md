@@ -10,7 +10,7 @@ An in-game redzone creator for FiveM with a tablet-style admin panel, live leade
 - **In-game zone creator** — create, edit, enable/disable and delete redzones from a tablet UI. Place respawn points by running around and pressing E.
 - **Multi-framework** — auto-detects QBX, QB-Core and ESX.
 - **Multi-inventory** — ox_inventory, one_inventory, qs-inventory, qb-inventory, ps-inventory, core_inventory, codem-inventory, origen_inventory, tgiann-inventory, plus framework-native fallback.
-- **Multi-ambulance revive** — wasabi, core, esx-ambulancejob, qb-ambulancejob, qbx_medical, ars, ps-medic, fd, codem, lc_doj, t-ems, plus native fallback.
+- **Multi-ambulance revive** — built-in adapters for wasabi_ambulance (v1 & v2), qbx_medical, qb-ambulancejob, ps-medic, esx_ambulancejob, ars_ambulancejob and p_ambulancejob, plus a native fallback when no death system is installed. Anything else plugs in through `Config.ReviveExport`. Run `rz_medical` in the server console to see what was detected and what to configure.
 - **Leaderboards** — separate Redzone and Global leaderboards, player and gang rankings, Kills/Deaths/K-D columns (each toggleable), weekly auto-resets with prizes for #1.
 - **Kill feed & kill cam** — toggleable, repositionable.
 - **HUD** — six themes, six position presets, free drag, all player-customisable with admin-set defaults.

@@ -74,8 +74,3 @@ function CB.Notify(src, message, ntype)
     return try(function() return exports.community_bridge:SendNotify(src, message, ntype) end)
 end
 
--- ── Revive ──────────────────────────────────────────────────────
-function CB.Revive(src)
-    if not CB.active then return nil end
-    return try(function() return exports.community_bridge:RevivePlayer(src) end)
-end

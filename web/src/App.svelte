@@ -1,5 +1,5 @@
 <script>
-  import { resolveTheme } from './theme.js'
+  import { resolveTheme, setCustomTheme, accentVars } from './theme.js'
   import RedzoneHUD from './RedzoneHUD.svelte'
   import TabletApp from './TabletApp.svelte'
   import KillFeed from './KillFeed.svelte'
@@ -13,7 +13,7 @@
     display: false, mode: 'player', tab: 'rzleaderboard',
     zones: {}, gangs: {}, settings: {}, personalColor: null,
     lbData: { players: [], gangs: [], globalPlayers: [], totals: {} },
-    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, tabletScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit',
+    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, tabletScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit', customTheme: null,
   })
   let killcam = $state({ display: false, killer: '', id: 0, theme: 'lime' })
   let safezone = $state({ display: false, name: '', speedLimit: 0 })
@@ -29,6 +29,30 @@
   let kmMove = $state(false)
   let kfRef
   let options = $state({})
+
+  // The static :root tokens in index.html are the lime defaults. The admin's
+  // Global Theme Builder overrides them for the whole tablet + HUD chrome
+  // whenever a custom theme is set — it's a server-wide accent, so it applies
+  // regardless of each player's per-HUD theme id. With no custom theme set,
+  // we fall back to the lime defaults.
+  const DEFAULT_ROOT = {
+    '--accent': '#a3e635', '--accent-strong': '#bef264',
+    '--accent-soft': 'rgba(163,230,53,0.12)', '--accent-border': 'rgba(163,230,53,0.25)',
+    '--accent-text': '#0f0f11',
+  }
+  // A custom theme counts as "set" only if the admin actually changed it away
+  // from the lime default (so an untouched default doesn't lock out presets).
+  function customIsActive() {
+    const c = tablet.customTheme
+    return !!(c && c.accent && c.accent.toLowerCase() !== '#a3e635')
+  }
+  function applyRootTheme() {
+    const root = document.documentElement
+    const vars = customIsActive()
+      ? accentVars(tablet.customTheme.accent, tablet.customTheme.text)
+      : DEFAULT_ROOT
+    for (const k in vars) root.style.setProperty(k, vars[k])
+  }
 
   function handleMessage(event) {
     const d = event.data
@@ -76,7 +100,15 @@
       if (d.perms !== undefined) tablet.perms = d.perms
       if (d.options)  { tablet.options = d.options; options = d.options }
       if (d.personalColor !== undefined) tablet.personalColor = d.personalColor
-      if (d.hudTheme)  { hud.theme = d.hudTheme; killcam.theme = d.hudTheme; tablet.hudTheme = d.hudTheme }
+      if (d.customTheme) {
+        // Admin's global theme builder pick, synced to everyone. This is the
+        // server-wide tablet/HUD accent — apply it immediately, regardless of
+        // the per-player HUD theme id.
+        tablet.customTheme = d.customTheme
+        setCustomTheme(d.customTheme.accent, d.customTheme.text)
+        applyRootTheme()
+      }
+      if (d.hudTheme)  { hud.theme = d.hudTheme; killcam.theme = d.hudTheme; tablet.hudTheme = d.hudTheme; applyRootTheme() }
       if (d.hudPreset) { hud.preset = d.hudPreset; tablet.hudPreset = d.hudPreset }
       if (d.hudScale)  { hud.scale = +d.hudScale; tablet.hudScale = +d.hudScale }
       if (d.tabletScale) tablet.tabletScale = +d.tabletScale

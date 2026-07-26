@@ -26,6 +26,7 @@ Locales['en'] = {
     ['revive_need_cash']     = 'You need $%s cash to be revived here.',
     ['revive_need_bank']     = 'You need $%s in your bank to be revived here.',
     ['revive_failed']        = 'Automatic respawn failed — use the normal respawn option.',
+    ['revive_conflict']      = 'Auto-revive is being undone by another death system — use the normal respawn option.',
 
     -- Zones
     ['no_vehicles']          = 'Vehicles are not allowed in this redzone.',

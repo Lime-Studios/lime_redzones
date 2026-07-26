@@ -27,6 +27,13 @@ local Data = {
             personalColorOpacity = true, personalColorHue = true,
             gangLbEnabled = true, killFeedEnabled = true, killCamEnabled = true, killMessageEnabled = true,
             hudDefaultPreset = 'top', hudDefaultTheme = 'lime',
+            debugMode = false,
+            keybinds = {
+                leaderboard = { enabled = true,  key = 'F1' },
+                admin       = { enabled = false, key = 'F6' },
+                hudMove     = { enabled = false, key = 'F7' },
+            },
+            customTheme = { accent = '#A3E635', text = nil },
             killFeedDuration = 6000, killCamDuration = 5000,
             lbCols = { kills = true, deaths = true, kd = true, streak = false },
         },
@@ -429,6 +436,7 @@ local function BroadcastZones(target)
 end
 
 local streaks, lastKill, lastDeath, lastGlobal, lastRevive = {}, {}, {}, {}, {}
+local reviveInFlight = {}   -- src -> GetGameTimer() of the dispatch we're waiting on
 -- src -> safe zone id. Set from a client report that the server verifies
 -- against the player's real position, so it can't be spoofed for immunity.
 local playerInSafeZone = {}
@@ -436,6 +444,7 @@ local playerInSafeZone = {}
 -- pushes to every other open panel instead of them seeing stale data until
 -- they close and reopen.
 local panelOpen = {}
+local pendingReviveCharge = {}
 local lastRequest = {}
 
 -- Spam guard for request events, keyed per event so they don't block each other.
@@ -470,7 +479,19 @@ local function WeaponLabel(w)
     return (Config.WeaponNames and Config.WeaponNames[w]) or 'Weapon'
 end
 
+local lbDirty = false
 local function PushLeaderboard(target)
+    -- Broadcasts are DEBOUNCED: every kill/death used to rebuild + broadcast
+    -- three sorted lists to every client instantly, so an active zone produced
+    -- a constant stream of large net events (net-event pools are small and
+    -- crash the client when full). A global push now just marks dirty; the
+    -- flush thread below sends at most one broadcast every 2s. Direct pushes
+    -- to a single player stay immediate.
+    if target == nil or target == -1 then lbDirty = true return end
+    PushLeaderboardNow(target)
+end
+
+function PushLeaderboardNow(target)
     local pList, gList, glList = {}, {}, {}
     local rzKills, rzDeaths = 0, 0
     local glKills, glDeaths = 0, 0
@@ -504,6 +525,17 @@ local function PushLeaderboard(target)
             options = Data.settings.options,
         })
 end
+
+-- Flush debounced leaderboard broadcasts: at most one -1 push every 2s.
+CreateThread(function()
+    while true do
+        Wait(2000)
+        if lbDirty then
+            lbDirty = false
+            PushLeaderboardNow(-1)
+        end
+    end
+end)
 
 local function EnsureP(store, src)
     local id = GetIdentifier(src)
@@ -613,6 +645,33 @@ end)
 
 local RZ_DEBUG_SV = GetConvar('lime_redzones_debug', 'false') == 'true'
 local function dbgsv(...) if RZ_DEBUG_SV then print('[lime_redzones:sv]', ...) end end
+-- Global server-debug, respecting the Debug option too (bridges use this).
+function RZDbgSv(msg)
+    if RZ_DEBUG_SV or (Data and Data.settings and Data.settings.options and Data.settings.options.debugMode == true) then
+        print('[lime_redzones:sv] ' .. tostring(msg))
+    end
+end
+
+-- Client debug mirrored to the SERVER console. F8 output dies with a client
+-- crash; the server console survives, so the death/revive breadcrumbs that
+-- lead up to a crash stay visible. Secured: only accepted while the Debug
+-- mode option (or the server convar) is on, message length capped, and
+-- rate-limited per player so it can't be used to flood the console.
+local clientDbgLast = {}
+RegisterNetEvent('lime_redzones:server:clientDebug', function(msg)
+    local src = source
+    if not (RZ_DEBUG_SV or Data.settings.options.debugMode == true) then return end
+    if type(msg) ~= 'string' then return end
+    local now = GetGameTimer()
+    local b = clientDbgLast[src]
+    if b and (now - b.at) < 1000 then
+        b.n = b.n + 1
+        if b.n > 10 then return end   -- max 10 lines/sec per player
+    else
+        clientDbgLast[src] = { at = now, n = 1 }
+    end
+    print(('[lime_redzones:client %s|%s] %s'):format(src, GetPName(src), msg:sub(1, 256)))
+end)
 
 local function RewardAmount(it)
     if it.rand and it.min and it.max then return math.random(it.min, it.max) end
@@ -732,6 +791,11 @@ RegisterNetEvent('lime_redzones:server:reportDeath', function(zoneId)
     if not PlayerInZone(src, zone, 50.0) then return end
     lastDeath[src] = now
 
+    -- A fresh death ends whatever revive we were still waiting on, so the next
+    -- attemptRevive isn't blocked by the in-flight guard. Without this, dying
+    -- again shortly after a revive left the player stuck for up to 20s.
+    reviveInFlight[src] = nil
+
     streaks[src] = 0
     TriggerClientEvent('lime_redzones:client:syncStreak', src, 0)
 
@@ -782,9 +846,12 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
 
     -- Rate limit. A silently dropped retry used to leave the player dead with
     -- no further attempt, so the limiter no longer consumes the request — the
-    -- client keeps its pending request and retries after the window.
+    -- client keeps its pending request and retries after the window. Kept short
+    -- (3s) so a second death soon after a revive isn't stuck in a long queue;
+    -- it only exists to stop a burst of duplicate attempts hammering the
+    -- framework's revive export.
     local now = GetGameTimer() / 1000.0
-    if lastRevive[src] and (now - lastRevive[src]) < 8.0 then return end
+    if lastRevive[src] and (now - lastRevive[src]) < 3.0 then return end
     lastRevive[src] = now
 
     if zone.reviveInside == false then
@@ -800,41 +867,65 @@ RegisterNetEvent('lime_redzones:server:attemptRevive', function(zoneId, coords, 
     local valid = cx and cy and cz
         and math.abs(cz - zz) < 80.0
         and (((cx - zx)^2 + (cy - zy)^2) ^ 0.5) <= maxAway
+    -- `exact` says the destination is an admin-placed point whose height is
+    -- meant literally. It has to survive this rebuild: dropping it made every
+    -- revive look like a deliberately placed exit, so nothing was ever
+    -- ground-snapped and the fallback ring's wrong Z was used as-is.
+    local exact = (coords and coords.exact == true) or false
     if not valid then
         local away = zone.radius + (tonumber(zone.teleportAway) or 30.0)
-        coords = { x = zx + away, y = zy, z = zz }
+        coords = { x = zx + away, y = zy, z = zz, exact = false }
     else
-        coords = { x = cx, y = cy, z = cz }
+        coords = { x = cx, y = cy, z = cz, exact = exact }
     end
     heading = tonumber(heading) or 0.0
 
     local cost = tonumber(zone.reviveCost) or 0
     local fromBank = zone.reviveCostSource == 'bank'
 
-    -- Branch explicitly. `a and b or c` breaks here: when the bank charge
-    -- returns false the expression falls through and silently charges cash
-    -- instead, which both bills the wrong account and lets broke players
-    -- revive for free.
+    -- Money is taken ONLY when the client confirms the player is actually alive
+    -- (confirmRevive below). Charging up-front took money on every failed
+    -- attempt — and the retries multiplied it — which is the "keeps taking
+    -- money, revive didn't come through" bug. We dispatch the revive first and
+    -- bill exactly once, on success.
+    pendingReviveCharge[src] = { cost = cost, fromBank = fromBank, zone = zone.name or tostring(zoneId) }
+
+    -- One dispatch in flight per player. The 3s limiter above is a rate limit,
+    -- not a mutex: a client retry landing 4s into a slow revive passed it and
+    -- fired DoRevive a second time, so the ambulance job was told to revive
+    -- again and another verification thread was spawned on top of the first.
+    -- That stacking is what accumulated across repeated deaths.
+    if reviveInFlight[src] and (GetGameTimer() - reviveInFlight[src]) < 20000 then
+        return
+    end
+    reviveInFlight[src] = GetGameTimer()
+    DoRevive(src, coords, heading)
+end)
+
+-- Client confirms it is genuinely alive again. NOW we charge — once — and log.
+-- No confirmation => no charge.
+RegisterNetEvent('lime_redzones:server:confirmRevive', function()
+    local src = source
+    reviveInFlight[src] = nil   -- resolved; the next death may dispatch again
+    local pend = pendingReviveCharge[src]
+    if not pend then return end
+    pendingReviveCharge[src] = nil
+    local cost, fromBank = pend.cost, pend.fromBank
+    if cost <= 0 then return end
+
     local paid
-    if cost <= 0 then
-        paid = true
-    elseif fromBank then
+    if fromBank then
         paid = RemoveBank ~= nil and RemoveBank(src, cost, 'Redzone Revive') == true
     else
         paid = RemoveCash(src, cost) == true
     end
-
     if paid then
-        DoRevive(src, coords, heading)
-        if cost > 0 then NotifySv(src, ('Revived — $%s deducted%s.'):format(cost, fromBank and ' from bank' or ''), 'success') end
+        NotifySv(src, ('Revived — $%s deducted%s.'):format(cost, fromBank and ' from bank' or ''), 'success')
         if Log then
             Log('revives', 'Paid Revive', ('**%s** revived'):format(GetPName(src)),
-                { { name = 'Zone', value = zone.name or tostring(zoneId), inline = true },
+                { { name = 'Zone', value = pend.zone, inline = true },
                   { name = 'Cost', value = '$' .. tostring(cost) .. (fromBank and ' (bank)' or ' (cash)'), inline = true } })
         end
-    else
-        NotifySv(src, ('You need $%s %s to be revived here.'):format(cost, fromBank and 'in your bank' or 'cash'), 'error')
-        TriggerClientEvent('lime_redzones:client:reviveDenied', src)
     end
 end)
 
@@ -919,6 +1010,7 @@ end)
 -- ── Safe zone presence ──────────────────────────────────────────
 RegisterNetEvent('lime_redzones:server:syncSafePresence', function(zoneId)
     local src = source
+    if not reqOk(src, 0.4, 'safepresence') then return end
 
     if zoneId == nil then playerInSafeZone[src] = nil return end
 
@@ -941,6 +1033,9 @@ AddEventHandler('playerDropped', function()
     streaks[src], lastKill[src], lastDeath[src], lastGlobal[src], lastRevive[src], lastRequest[src] = nil, nil, nil, nil, nil, nil
     playerInSafeZone[src] = nil
     panelOpen[src] = nil
+    clientDbgLast[src] = nil
+    pendingReviveCharge[src] = nil
+    reviveInFlight[src] = nil
 end)
 
 -- Admin teleport: a management tool, not the player-facing paid flow. Free,
@@ -959,6 +1054,7 @@ end)
 -- Re-send this viewer's panel data on demand (the tablet's refresh button).
 RegisterNetEvent('lime_redzones:server:requestAdminData', function()
     local src = source
+    if not reqOk(src, 1.0, 'admindata') then return end
     if not IsAdmin(src) then return end
     panelOpen[src] = true
     TriggerClientEvent('lime_redzones:client:adminData', src, Data.zones, Data.customGangs, Data.settings, GetAdminPerms(src))
@@ -1128,6 +1224,7 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
         polyMaxZ = tonumber(zone.polyMaxZ) or nil,
         showBlip = zone.showBlip ~= false,
         showRadiusBlip = zone.showRadiusBlip ~= false,
+        hideHud = zone.hideHud == true,
         enabled = zone.enabled ~= false,
     }
 
@@ -1166,7 +1263,6 @@ RegisterNetEvent('lime_redzones:server:saveZone', function(zone)
         base.teleportNpcs         = teleportNpcs
         base.deleteVehicleOnEntry = zone.deleteVehicleOnEntry ~= false  -- redzone: default ON
         base.infiniteStamina      = zone.infiniteStamina == true
-        base.blockOutsideShooting = zone.blockOutsideShooting == true
         base.allowTeleport        = zone.allowTeleport == true
         base.teleportCost         = math.max(0, math.floor(tonumber(zone.teleportCost) or 0))
         base.teleportCostSource   = zone.teleportCostSource == 'bank' and 'bank' or 'cash'
@@ -1190,12 +1286,14 @@ RegisterNetEvent('lime_redzones:server:bulkUpdateZones', function(ids, patch)
     -- are per-zone and set in the normal editor.
     local RZ_FIELDS = {
         enabled = 'bool', showBlip = 'bool', showRadiusBlip = 'bool', showMarker = 'bool',
-        deleteVehicleOnEntry = 'bool', infiniteStamina = 'bool', blockOutsideShooting = 'bool',
+        hideHud = 'bool',
+        deleteVehicleOnEntry = 'bool', infiniteStamina = 'bool',
         allowTeleport = 'bool', teleportCost = 'int', teleportCostSource = 'source',
         reviveCost = 'int', reviveCostSource = 'source', reviveInside = 'bool',
     }
     local SAFE_FIELDS = {
         enabled = 'bool', showBlip = 'bool', showRadiusBlip = 'bool', showMarker = 'bool',
+        hideHud = 'bool',
         deleteVehicleOnEntry = 'bool', invincible = 'bool', phaseThrough = 'bool',
         speedLimit = 'int', weaponMode = 'wmode',
     }
@@ -1341,6 +1439,27 @@ RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
     o.killCamDuration      = math.max(2000, math.min(15000, math.floor(tonumber(opts.killCamDuration) or 5000)))
     o.killCamEnabled       = opts.killCamEnabled ~= false
     o.tabletAnim           = opts.tabletAnim ~= false
+    o.debugMode            = opts.debugMode == true
+    if type(opts.keybinds) == 'table' then
+        -- Only three binds are supported; keys are sanitised to a short
+        -- alphanumeric token (FiveM key names like F1, GRAVE, K).
+        local function cleanKey(v, fallback)
+            v = tostring(v or ''):upper():gsub('[^A-Z0-9]', '')
+            if v == '' or #v > 12 then return fallback end
+            return v
+        end
+        o.keybinds = o.keybinds or {}
+        for _, name in ipairs({ 'leaderboard', 'admin', 'hudMove' }) do
+            local inb = opts.keybinds[name]
+            if type(inb) == 'table' then
+                local prev = o.keybinds[name] or {}
+                o.keybinds[name] = {
+                    enabled = inb.enabled == true,
+                    key = cleanKey(inb.key, prev.key or 'F1'),
+                }
+            end
+        end
+    end
     if opts.hudDefaultPreset then o.hudDefaultPreset = tostring(opts.hudDefaultPreset):sub(1,12) end
     if opts.hudDefaultTheme then o.hudDefaultTheme = tostring(opts.hudDefaultTheme):sub(1,12) end
     if type(opts.lbCols) == 'table' then
@@ -1357,6 +1476,30 @@ RegisterNetEvent('lime_redzones:server:saveOptions', function(opts)
     BroadcastAdminData()
     NotifySv(src, 'Options saved.', 'success')
     if Log then Log('admin', 'Options Updated', ('**%s** updated server options'):format(GetPName(src))) end
+end)
+
+-- Global theme builder. Stores an admin-chosen accent (and optional text
+-- colour) and pushes it to every player immediately. text = nil means clients
+-- auto-pick black/white for contrast.
+local function isHex6(s)
+    return type(s) == 'string' and s:match('^#%x%x%x%x%x%x$') ~= nil
+end
+
+RegisterNetEvent('lime_redzones:server:saveCustomTheme', function(theme)
+    local src = source
+    if not HasPerm(src, 'options') then return end
+    if type(theme) ~= 'table' then return end
+    local accent = isHex6(theme.accent) and theme.accent or '#A3E635'
+    local text   = isHex6(theme.text) and theme.text or nil
+    Data.settings.options.customTheme = { accent = accent, text = text }
+    SaveData()
+    -- Sync options (carries customTheme) AND a lightweight direct broadcast so
+    -- the tablet/HUD recolour without needing an options round-trip.
+    TriggerClientEvent('lime_redzones:client:syncOptions', -1, Data.settings.options)
+    TriggerClientEvent('lime_redzones:client:syncCustomTheme', -1, Data.settings.options.customTheme)
+    BroadcastAdminData()
+    NotifySv(src, 'Theme applied to all players.', 'success')
+    if Log then Log('admin', 'Theme Updated', ('**%s** set the global theme accent to %s'):format(GetPName(src), accent)) end
 end)
 
 RegisterNetEvent('lime_redzones:server:saveRanks', function(ranks)

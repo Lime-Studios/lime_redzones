@@ -1,11 +1,11 @@
 <script>
-  import { THEME_IDS, accentOf } from './theme.js'
+  import { THEME_IDS, accentOf, bestTextOn, rgba } from './theme.js'
   import Tutorial from './Tutorial.svelte'
   let { display = false, mode = 'player', tab = 'rzleaderboard',
         zones = {}, gangs = {}, settings = {}, personalColor = null,
         lbData = { players: [], gangs: [], globalPlayers: [], totals: {} },
         placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logTotal = 0, logConfig = null, prizeHistory = [], firstTime = false, stats = {},
-        hudTheme = 'lime', hudPreset = 'top', hudScale = 1, tabletScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit',
+        hudTheme = 'lime', hudPreset = 'top', hudScale = 1, tabletScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit', customTheme = null,
         onclose } = $props()
 
   const O = $derived(options ?? {})
@@ -23,6 +23,34 @@
   let clock = $state('')
   let selTheme = $state('lime')
   let selPreset = $state('top')
+  // Global theme builder (admin Options tab).
+  let customAccent = $state('#A3E635')
+  let customText = $state('#0a0b0d')
+  let customAuto = $state(true)
+  const autoText = $derived(bestTextOn(customAccent))
+
+  // Keybinds editor. opts.keybinds is the source of truth (saved via saveOptions);
+  // this derived view fills safe defaults so the inputs always have something to
+  // bind to even before the server sync populates it.
+  const KB_DEFAULTS = { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } }
+  const keybinds = $derived.by(() => {
+    const src = opts.keybinds ?? {}
+    const out = {}
+    for (const k in KB_DEFAULTS) out[k] = { ...KB_DEFAULTS[k], ...(src[k] ?? {}) }
+    return out
+  })
+  function ensureKb() {
+    if (!opts.keybinds) opts.keybinds = structuredClone(keybinds)
+    return opts.keybinds
+  }
+  function setKey(name, val) {
+    const kb = ensureKb()
+    kb[name] = { ...kb[name], key: (val || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12) }
+  }
+  function toggleKey(name) {
+    const kb = ensureKb()
+    kb[name] = { ...kb[name], enabled: !kb[name].enabled }
+  }
   let hudScaleVal = $state(1)
   let kfScaleVal = $state(1)
   let kfThemeVal = $state('inherit')
@@ -127,7 +155,15 @@
   })
   let styleInit = $state(false)
   $effect(() => {
-    if (display && !styleInit) { selTheme = hudTheme; selPreset = hudPreset; hudScaleVal = hudScale || 1; kfScaleVal = killfeedScale || 1; kfThemeVal = killfeedTheme || 'inherit'; kmScaleVal = killmsgScale || 1; kmThemeVal = killmsgTheme || 'inherit'; styleInit = true }
+    if (display && !styleInit) {
+      selTheme = hudTheme; selPreset = hudPreset; hudScaleVal = hudScale || 1; kfScaleVal = killfeedScale || 1; kfThemeVal = killfeedTheme || 'inherit'; kmScaleVal = killmsgScale || 1; kmThemeVal = killmsgTheme || 'inherit';
+      if (customTheme && customTheme.accent) {
+        customAccent = customTheme.accent
+        customText = customTheme.text || bestTextOn(customTheme.accent)
+        customAuto = !customTheme.text
+      }
+      styleInit = true
+    }
     if (!display) styleInit = false
   })
   $effect(() => { if (!display) { editing = null; lbTab = 'players' } })
@@ -176,6 +212,12 @@
   const post = (cb, data = {}) =>
     fetch(`https://lime_redzones/${cb}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
       .then(r => r.json()).catch(() => ({}))
+
+  // Push the admin's custom accent to the server, which stores it and syncs it
+  // to every connected player. text:null tells clients to auto-pick contrast.
+  function saveCustomTheme() {
+    post('saveCustomTheme', { accent: customAccent, text: customAuto ? null : customText })
+  }
 
   const zoneList = $derived(Object.values(zones ?? {}))
   let bulkMode = $state(false)
@@ -298,6 +340,7 @@
     streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
     killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
     tabletAnim: true,
+    keybinds: { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } },
     lbCols: { kills: true, deaths: true, kd: true },
   })
   let settingsKey = $state(null)
@@ -315,9 +358,10 @@
         streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
         killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
         tabletAnim: true,
+        keybinds: { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } },
         lbCols: { kills: true, deaths: true, kd: true },
       }
-      opts = { ...def, ...settings.options, lbCols: { ...def.lbCols, ...(settings.options.lbCols ?? {}) } }
+      opts = { ...def, ...settings.options, keybinds: { ...def.keybinds, ...(settings.options.keybinds ?? {}) }, lbCols: { ...def.lbCols, ...(settings.options.lbCols ?? {}) } }
     }
     if (settings.ranks) ranks = JSON.parse(JSON.stringify(settings.ranks))
   })
@@ -353,13 +397,13 @@
     invincible: true, disableWeapons: true, weaponMode: 'holster', phaseThrough: true, speedLimit: 0, deleteVehicleOnEntry: false,
     allowTeleport: false, teleportCost: 0, teleportCostSource: 'cash', tpPoints: [],
     poly: [], polyMinZ: null, polyMaxZ: null,
-    showBlip: true, showRadiusBlip: true, enabled: true,
+    showBlip: true, showRadiusBlip: true, hideHud: false, enabled: true,
   }) : ({
     id: null, type: 'redzone', name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
     colorHex: '#FF0000', colorA: 80, blipSprite: 310, blipColor: 1,
     rewardItems: [{ name: 'money', amount: 500 }], streakRewards: [],
     reviveCost: 10000, reviveInside: true, reviveDelay: 8000, reviveCostSource: 'cash', teleportAway: 30, exits: [], enabled: true,
-    deleteVehicleOnEntry: true, infiniteStamina: false, showBlip: true, showRadiusBlip: true, showMarker: true, blockOutsideShooting: false,
+    deleteVehicleOnEntry: true, infiniteStamina: false, showBlip: true, showRadiusBlip: true, showMarker: true, hideHud: false,
     allowTeleport: false, teleportCost: 0, teleportCostSource: 'cash', tpPoints: [],
     poly: [], polyMinZ: null, polyMaxZ: null,
   })
@@ -848,8 +892,8 @@
               <p class="hint">Toggle only what you want to change. Untouched options are left as-is on each zone.</p>
 
               {#each (bulkType === 'safezone'
-                ? [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['invincible','Invincible inside'],['phaseThrough','Phase through'],['deleteVehicleOnEntry','Delete vehicles on entry']]
-                : [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['showRadiusBlip','Show radius blip'],['deleteVehicleOnEntry','Delete vehicles on entry'],['infiniteStamina','Infinite stamina'],['blockOutsideShooting','Block outside shooting'],['allowTeleport','Allow teleport'],['reviveInside','Revive inside']]
+                ? [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['hideHud','Hide on-screen HUD'],['invincible','Invincible inside'],['phaseThrough','Phase through'],['deleteVehicleOnEntry','Delete vehicles on entry']]
+                : [['enabled','Enabled'],['showMarker','Show zone visual'],['showBlip','Show blip'],['showRadiusBlip','Show radius blip'],['hideHud','Hide on-screen HUD'],['deleteVehicleOnEntry','Delete vehicles on entry'],['infiniteStamina','Infinite stamina'],['allowTeleport','Allow teleport'],['reviveInside','Revive inside']]
               ) as f}
                 <div class="bulk-row" class:active={f[0] in bulkPatch}>
                   <button class="bulk-inc" class:on={f[0] in bulkPatch} onclick={() => (f[0] in bulkPatch) ? bulkUnset(f[0]) : bulkSetField(f[0], true)} aria-label="Include">
@@ -1020,6 +1064,7 @@
             { k: 'tabletAnim', t: 'Tablet animation', d: 'Hold a tablet prop + animation while the panel is open.' },
             { k: 'rewardNotify', t: 'Reward notifications', d: 'Notify on every kill reward.' },
             { k: 'streakAnnounce', t: 'Streak announcements', d: 'Announce streak unlocks.' },
+            { k: 'debugMode', t: 'Debug mode', d: 'Print zone/death/revive diagnostics to F8 for all players. Leave off in production.' },
           ] as f}
             <div class="frow between"><div><b>{f.t}</b><p class="hint">{f.d}</p></div><button class="sw" class:on={opts[f.k]} onclick={() => opts[f.k] = !opts[f.k]} aria-label="Toggle"><i></i></button></div>
           {/each}
@@ -1040,6 +1085,47 @@
           <label class="f"><span>Default theme</span><select bind:value={opts.hudDefaultTheme}>{#each THEME_LIST as t}<option value={t.id}>{t.id}</option>{/each}</select></label>
           <label class="f"><span>Default position preset</span><select bind:value={opts.hudDefaultPreset}>{#each PRESET_LIST as pr}<option value={pr}>{pr}</option>{/each}</select></label>
           <p class="hint">Players who haven't customised use these defaults.</p>
+        </div>
+        <div class="block">
+          <b class="blk-title">Global Theme Builder</b>
+          <p class="hint">Design a custom accent for everyone. Pick "custom" as the default theme above (or let players pick it) and these colours apply to every player's tablet and HUD.</p>
+          <div class="tb-row">
+            <label class="tb-swatch">
+              <span>Accent</span>
+              <input type="color" bind:value={customAccent} />
+              <code>{customAccent}</code>
+            </label>
+            <label class="tb-swatch">
+              <span>Text on accent</span>
+              <input type="color" bind:value={customText} disabled={customAuto} />
+              <code>{customAuto ? 'auto' : customText}</code>
+            </label>
+          </div>
+          <div class="frow between"><div><b>Auto-pick text colour</b><p class="hint">Choose black/white for best contrast automatically.</p></div><button class="sw" class:on={customAuto} onclick={() => customAuto = !customAuto} aria-label="Toggle"><i></i></button></div>
+          <div class="tb-preview" style:--tb-accent={customAccent} style:--tb-text={customAuto ? autoText : customText} style:--tb-soft={rgba(customAccent, 0.14)} style:--tb-border={rgba(customAccent, 0.3)}>
+            <div class="tb-blade">REDZONE <span>3 / 1 / 2</span></div>
+            <button class="tb-btn">Primary button</button>
+            <span class="tb-pill">Accent pill</span>
+          </div>
+          <button class="btn go end" onclick={saveCustomTheme}>Apply theme to all players</button>
+        </div>
+        <div class="block">
+          <b class="blk-title">Keybinds</b>
+          <p class="hint">Default keys for each action. Players can still rebind in GTA Settings → Key Bindings. Changes apply after a resource restart.</p>
+          {#each [
+            { k: 'leaderboard', t: 'Open leaderboard', d: 'Toggles the player tablet.' },
+            { k: 'admin', t: 'Open admin panel', d: 'Admin tablet (permission required).' },
+            { k: 'hudMove', t: 'Move HUD', d: 'Enters HUD reposition mode.' },
+          ] as kb}
+            <div class="kb-row">
+              <div class="kb-info"><b>{kb.t}</b><p class="hint">{kb.d}</p></div>
+              <input class="kb-key" type="text" maxlength="12" placeholder="F1"
+                value={keybinds[kb.k].key}
+                oninput={(e) => setKey(kb.k, e.target.value)}
+                disabled={!keybinds[kb.k].enabled} />
+              <button class="sw" class:on={keybinds[kb.k].enabled} onclick={() => toggleKey(kb.k)} aria-label="Toggle"><i></i></button>
+            </div>
+          {/each}
         </div>
         <div class="block">
           <b class="blk-title">Rendering</b>
@@ -1160,7 +1246,7 @@
       {#if (editing.poly?.length ?? 0) >= 3}
         <div class="frow inset">
           <span class="dim grow">Custom shape — {editing.poly.length} corners</span>
-          <button class="ib red" onclick={() => editing.poly = []} title="Clear shape">✕</button>
+          <button class="btn red sm" onclick={() => { editing.poly = []; editing.polyMinZ = null; editing.polyMaxZ = null; }} title="Discard the drawn outline and go back to a circular zone">↺ Reset to circle</button>
         </div>
         <p class="hint">The outline decides everything — centre and radius are calculated from it automatically.</p>
       {:else}
@@ -1171,6 +1257,9 @@
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 7l9-4 9 4-9 4-9-4zM3 7v10l9 4 9-4V7" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
           {(editing.poly?.length ?? 0) >= 3 ? 'Redraw shape' : 'Draw shape in world'}
         </button>
+        {#if (editing.poly?.length ?? 0) >= 3}
+          <button class="btn red" onclick={() => { editing.poly = []; editing.polyMinZ = null; editing.polyMaxZ = null; }} title="Discard the drawn outline and go back to a circular zone">↺ Reset to circle</button>
+        {/if}
       </div>
       {#if (editing.poly?.length ?? 0) >= 3}
         <div class="frow">
@@ -1241,8 +1330,6 @@
       <div class="e-sec">Zone Behaviour</div>
       <div class="frow between"><div><b>Delete vehicles on entry</b><p class="hint">Cars are removed instantly when they drive into this zone.</p></div><button class="sw" class:on={editing.deleteVehicleOnEntry !== false} onclick={() => editing.deleteVehicleOnEntry = editing.deleteVehicleOnEntry === false ? true : false} aria-label="Toggle"><i></i></button></div>
       <div class="frow between"><div><b>Infinite stamina</b><p class="hint">Players never run out of breath while inside.</p></div><button class="sw" class:on={editing.infiniteStamina === true} onclick={() => editing.infiniteStamina = !editing.infiniteStamina} aria-label="Toggle"><i></i></button></div>
-      <div class="frow between"><div><b>Block shooting from outside</b><p class="hint">Players outside can't fire in — stops perimeter camping.</p></div><button class="sw" class:on={editing.blockOutsideShooting === true} onclick={() => editing.blockOutsideShooting = !editing.blockOutsideShooting} aria-label="Toggle"><i></i></button></div>
-
       <label class="f"><span>Locked weapons <em>{(editing.allowedWeapons?.length ?? 0) > 0 ? 'only listed weapons usable' : 'all weapons allowed'}</em></span>
         <div class="frow wrapchips">
           {#each editing.allowedWeapons ?? [] as w, wi}
@@ -1300,6 +1387,7 @@
       {/if}
 
       <div class="frow between"><div><b>Show zone visual</b><p class="hint">The in-world dome/walls. Off = invisible zone, still fully active — and cheaper to run.</p></div><button class="sw" class:on={editing.showMarker !== false} onclick={() => editing.showMarker = editing.showMarker === false} aria-label="Toggle"><i></i></button></div>
+      <div class="frow between"><div><b>Hide on-screen HUD</b><p class="hint">Hides the {isSafe ? 'Safe Zone badge' : 'kills/deaths HUD'} for players inside. The zone still works normally.</p></div><button class="sw" class:on={editing.hideHud === true} onclick={() => editing.hideHud = !editing.hideHud} aria-label="Toggle"><i></i></button></div>
       <div class="frow between"><div><b>Show blip on map</b><p class="hint">The zone's map icon. Turn off to hide the zone entirely.</p></div><button class="sw" class:on={editing.showBlip !== false} onclick={() => editing.showBlip = editing.showBlip === false ? true : false} aria-label="Toggle"><i></i></button></div>
       <div class="frow between"><div><b>Show circle on map</b><p class="hint">The radius ring around the blip.</p></div><button class="sw" class:on={editing.showRadiusBlip !== false} onclick={() => editing.showRadiusBlip = editing.showRadiusBlip === false ? true : false} aria-label="Toggle" disabled={editing.showBlip === false}><i></i></button></div>
 
@@ -1394,6 +1482,7 @@
   .btn.go { background: var(--accent); border-color: transparent; color: var(--accent-text); }
   .btn.go:hover { background: var(--accent-strong); }
   .btn.red { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+  .btn.sm { padding: 4px 9px; font-size: 11px; flex: 0 0 auto; }
   .btn.ghost { background: transparent; border-color: transparent; }
   .btn.dash { background: transparent; border: 1px dashed rgba(255,255,255,0.15); align-self: flex-start; }
   .end { align-self: flex-end; }
@@ -1450,6 +1539,27 @@
   .themes { display: flex; flex-wrap: wrap; gap: 7px; }
   .theme-chip { display: flex; align-items: center; gap: 7px; padding: 7px 13px; background: #1d2026; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: rgba(255,255,255,0.7); font-size: 12px; font-weight: 700; font-family: inherit; cursor: pointer; text-transform: capitalize; }
   .theme-chip.on { border-color: var(--accent); color: #fff; background: var(--accent-soft); }
+
+  .kb-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .kb-row:last-child { border-bottom: none; }
+  .kb-info { flex: 1 1 auto; min-width: 0; }
+  .kb-info b { font-size: 12.5px; }
+  .kb-info .hint { margin-top: 1px; white-space: normal; }
+  .kb-row input.kb-key { flex: 0 0 64px; width: 64px; min-width: 0; text-align: center; padding: 6px 4px; font-size: 12px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+  .kb-row input.kb-key:focus { border-color: var(--accent); }
+  .kb-row .sw { flex: 0 0 auto; }
+
+  .tb-row { display: flex; gap: 10px; margin: 4px 0 8px; }
+  .tb-swatch { flex: 1; display: flex; flex-direction: column; gap: 5px; background: #1d2026; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 9px 11px; }
+  .tb-swatch span { font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.7); }
+  .tb-swatch input[type=color] { width: 100%; height: 30px; padding: 0; border: none; border-radius: 7px; background: none; cursor: pointer; }
+  .tb-swatch input[type=color]:disabled { opacity: 0.4; cursor: not-allowed; }
+  .tb-swatch code { font-size: 10.5px; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: 0.04em; }
+  .tb-preview { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: #0d0e11; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px; margin: 8px 0; }
+  .tb-blade { display: inline-flex; align-items: center; gap: 8px; background: var(--tb-accent); color: var(--tb-text); font-size: 12px; font-weight: 900; letter-spacing: 0.05em; padding: 6px 14px; border-radius: 7px; }
+  .tb-blade span { font-weight: 800; opacity: 0.85; }
+  .tb-btn { background: var(--tb-accent); color: var(--tb-text); border: none; border-radius: 99px; padding: 7px 18px; font-size: 12px; font-weight: 900; font-family: inherit; }
+  .tb-pill { background: var(--tb-soft); color: var(--tb-accent); border: 1px solid var(--tb-border); border-radius: 99px; padding: 5px 13px; font-size: 11px; font-weight: 800; }
   .theme-dot { width: 14px; height: 14px; border-radius: 50%; }
   .presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; }
   .preset-chip { padding: 9px; text-transform: capitalize; background: #1d2026; border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: rgba(255,255,255,0.7); font-size: 11.5px; font-weight: 700; font-family: inherit; cursor: pointer; }

@@ -5,13 +5,43 @@ local currentSafeId    = nil
 -- a single fire-and-forget attempt could be lost to a dropped event, the
 -- server's rate limit, or a revive that silently failed.
 local reviveRequest    = nil
-local RZ_DEBUG         = false  -- toggle with /rz_debug
+-- Debug output. Driven by the admin "Debug mode" option (server-synced), with
+-- an optional per-client override via /rz_debug. RZ_DEBUG_LOCAL: nil = follow
+-- the server option, true/false = a manual override for this client only.
+local RZ_DEBUG         = false
+local RZ_DEBUG_LOCAL   = nil
+local RZ_DEBUG_SERVER  = false
+local function resolveDebug()
+    if RZ_DEBUG_LOCAL ~= nil then RZ_DEBUG = RZ_DEBUG_LOCAL else RZ_DEBUG = RZ_DEBUG_SERVER end
+end
+-- Debug print that ALSO mirrors to the server console (rate-limited). F8 is
+-- lost when the client crashes; the server console keeps the breadcrumb trail
+-- leading up to it. Global so the bridge files can use it too.
+local _sdbgLast, _sdbgN = 0, 0
+function RZDbg(msg)
+    if not RZ_DEBUG then return end
+    msg = tostring(msg)
+    print('[lime_redzones] ' .. msg)
+    local now = GetGameTimer()
+    if now - _sdbgLast > 1000 then _sdbgLast, _sdbgN = now, 0 end
+    _sdbgN = _sdbgN + 1
+    if _sdbgN <= 8 then
+        TriggerServerEvent('lime_redzones:server:clientDebug', msg)
+    end
+end
 local kills, deaths, killStreak = 0, 0, 0
 local recentKills = {}  -- victim ped -> last kill time (dedup repeated damage events)
+local pendingPoll = {}  -- victim ped -> true while a death poll thread is live
 local wasDead          = false
+local downedSince      = nil
+local reviveDispatchedAt = nil
 local tabletOpen, tabletMode, hudMoveMode = false, nil, false
 local personalColor    = nil
 local hudPos           = nil
+-- Options sync arrives after these are declared, but RunKillCam / SetTabletAnim
+-- reference Opts before line 400 — a local declared lower reads as nil (global)
+-- above its declaration, which crashed the render thread pre-sync. Hoisted.
+local Opts             = {}
 
 local function HexToRGB(hex)
     hex = hex:gsub('#', '')
@@ -34,6 +64,274 @@ local function PointInPoly(x, y, poly)
     return inside
 end
 
+-- True when the player is dead OR in a framework "downed/laststand" state.
+-- Many ambulance jobs leave you downed at nonzero health with IsEntityDead
+-- FALSE — which is why a revive sometimes never fired despite being "killed".
+--
+-- The real check lives in bridge/ambulance.lua (LimeIsDowned) because it needs
+-- to ask the detected ambulance job directly: wasabi neither leaves the ped
+-- natively dead nor sets a downed statebag, so a generic check reads a downed
+-- wasabi player as alive and the death was cleared before the revive fired.
+-- Keeping one implementation means the zone loop and the revive chain can't
+-- disagree about whether a death happened. The fallback below only runs if the
+-- bridge file failed to load.
+local function isDownedOrDead(ped)
+    if type(LimeIsDowned) == 'function' then return LimeIsDowned(ped) end
+    if IsEntityDead(ped) then return true end
+    if IsPedDeadOrDying(ped, true) then return true end
+    local ok, v = pcall(function() return LocalPlayer.state.isDead end)
+    if ok and v == true then return true end
+    return GetEntityHealth(ped) <= 5 and IsPedRagdoll(ped)
+end
+
+-- Debounced "genuinely back up, and staying up".
+--
+-- A death system does not go from alive to downed in one clean step. wasabi
+-- kills the ped, then resurrects it into a downed animation — so for a short
+-- window mid-death the ped is natively alive AND wasabi's own isPlayerDead()
+-- has not flipped true yet. Every downed signal reads false at once.
+--
+-- Treating that flicker as "the player got up" cancelled the queued revive
+-- before its delay elapsed, which is the "revives the first time but not the
+-- second" bug: it is a race, so it lands differently on each death (the kill
+-- cam starting on one death and not another is enough to shift the timing).
+--
+-- Requiring the not-downed reading to HOLD makes the check immune to that
+-- window regardless of which death system is installed, while still cancelling
+-- promptly when a medic genuinely revives someone before our delay is up.
+local UP_GRACE_MS = 2000
+local upSince = nil
+local function confirmedUp(ped)
+    if isDownedOrDead(ped) then upSince = nil return false end
+    upSince = upSince or GetGameTimer()
+    return (GetGameTimer() - upSince) >= UP_GRACE_MS
+end
+
+-- Kill cam: spectate the killer's POV briefly after dying in a zone.
+local killCamHandle = nil
+local killCamActive = false
+-- Bumped on every teardown so a kill-cam thread that is still winding down can
+-- tell its run is over. Without it, a thread from the PREVIOUS death would run
+-- its teardown against whatever handle was current — destroying the camera the
+-- NEXT death had just created, and leaving that death's camera half-alive.
+local killCamGen = 0
+
+-- Every camera this resource creates, until it is destroyed. A camera is a
+-- pooled game object: leaking one per death fills the pool within a handful of
+-- deaths and the game hard-crashes with "Pool Full". Ownership tracking is
+-- deliberately independent of killCamHandle/killCamGen — those describe which
+-- camera is CURRENT, which is a different question from which ones still EXIST,
+-- and conflating the two is what allowed the leak below.
+-- Tagged by owner ('kill' | 'editor'). The two have completely separate
+-- lifecycles — the shape editor's camera lives as long as an admin is editing
+-- — so a sweep must never reach across. An untagged sweep would destroy the
+-- editor camera out from under an admin who happened to die while editing.
+local liveCams = {}
+
+local function makeCam(kind)
+    local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    if not (cam and cam ~= 0 and DoesCamExist(cam)) then return nil end
+    liveCams[cam] = kind
+    return cam
+end
+
+local function dropCam(cam)
+    if cam == nil then return end
+    if DoesCamExist(cam) then
+        SetCamActive(cam, false)
+        DestroyCam(cam, false)
+    end
+    liveCams[cam] = nil
+    if killCamHandle == cam then killCamHandle = nil end
+end
+
+-- Safety net: destroy anything of `kind` we created that is somehow still
+-- alive (nil = every kind, for resource stop). Cheap — the table is empty in
+-- the normal case — and it makes a leak self-healing rather than terminal.
+local function reapCams(kind)
+    for cam, k in pairs(liveCams) do
+        if kind == nil or k == kind then dropCam(cam) end
+    end
+end
+
+-- Pool census, logged on every death. A "Pool Full" crash names the pool only
+-- sometimes ("<<unknown pool>>" when the hash isn't in the client's table), so
+-- watching the counts climb across deaths identifies the leak directly instead
+-- of it having to be inferred from which death crashes.
+-- ⚠ NEVER call this automatically. GetGamePool allocates a script GUID for
+-- EVERY entity it returns, so one call enumerating peds + objects + vehicles +
+-- pickups churns through thousands of handles on a busy map. Wiring it into
+-- the death path (behind the debug flag) meant that anyone running with debug
+-- ON — i.e. anyone collecting logs to diagnose a pool crash — was allocating
+-- thousands of handles per death, making the very crash they were chasing
+-- arrive sooner. It is manual-only, via /rz_pools.
+local POOL_NAMES = { 'CPed', 'CObject', 'CVehicle', 'CPickup' }
+local poolBase = nil   -- counts at the first sample, for the delta below
+
+local function poolCounts()
+    local out = {}
+    for _, name in ipairs(POOL_NAMES) do
+        local ok, t = pcall(GetGamePool, name)
+        out[name] = (ok and type(t) == 'table') and #t or -1
+    end
+    local cams = 0
+    for _ in pairs(liveCams) do cams = cams + 1 end
+    out.ourCams = cams
+    return out
+end
+
+-- Absolute counts don't reveal much on their own — GTA's own pools rise and
+-- fall constantly. The DELTA since the first death is what matters: a number
+-- that only ever climbs across deaths is the leak, and it names itself.
+local function poolCensus()
+    local now = poolCounts()
+    poolBase = poolBase or now
+    local parts = {}
+    for _, name in ipairs(POOL_NAMES) do
+        parts[#parts + 1] = ('%s=%d(%+d)'):format(name:sub(2):lower(), now[name], now[name] - poolBase[name])
+    end
+    parts[#parts + 1] = ('ourCams=%d'):format(now.ourCams)
+    return 'pools: ' .. table.concat(parts, ' ')
+end
+
+local function destroyKillCam()
+    killCamGen = killCamGen + 1
+    if killCamHandle ~= nil then
+        -- Drop the render override ONLY when the camera being torn down is
+        -- ours. This used to run unconditionally on every teardown — including
+        -- from the post-revive teleport — which also cancelled whatever camera
+        -- another resource had active, an ambulance job's death cam included.
+        RenderScriptCams(false, false, 0, true, true)
+        dropCam(killCamHandle)
+    end
+    reapCams('kill')
+    if killCamActive then
+        killCamActive = false
+        SendNUIMessage({ type = 'killCam', display = false })
+    end
+end
+
+local function RunKillCam(ped)
+    if type(Opts) ~= 'table' or Opts.killCamEnabled == false then return end
+    if killCamActive then return end
+    local killer = GetPedSourceOfDeath(ped)
+    if not (killer and killer ~= 0 and killer ~= ped and DoesEntityExist(killer)) then return end
+    -- Must be another PLAYER's ped. Ambulance jobs that down you without
+    -- killing the ped (wasabi) leave GetPedSourceOfDeath returning a stale
+    -- handle from an earlier death, so an unverified handle here would open a
+    -- scripted camera — and take over RenderScriptCams — during someone else's
+    -- death sequence.
+    if not IsPedAPlayer(killer) then return end
+    killCamActive = true
+    -- Sweep anything left over from a previous run before adding another. This
+    -- used to DestroyCam the old handle directly, which left it registered as
+    -- live; dropCam/reapCams keep the registry honest.
+    dropCam(killCamHandle)
+    reapCams('kill')
+
+    -- Resolve the killer's identity up front from the ped handle.
+    local kPlayer = NetworkGetPlayerIndexFromPed(killer)
+    if kPlayer == -1 then
+        for _, pid in ipairs(GetActivePlayers()) do
+            if GetPlayerPed(pid) == killer then kPlayer = pid break end
+        end
+    end
+    local killerName = (kPlayer and kPlayer ~= -1) and GetPlayerName(kPlayer) or 'Unknown'
+    local killerId = (kPlayer and kPlayer ~= -1) and GetPlayerServerId(kPlayer) or 0
+    local camDur = math.max(1000, tonumber(Opts.killCamDuration) or 5000)
+    SendNUIMessage({ type = 'killCam', display = true, killer = killerName, id = killerId, duration = camDur })
+    RZDbg('killcam start (killer '..tostring(killerId)..')')
+
+    local myGen = killCamGen
+    CreateThread(function()
+        -- Finite-guard: a NaN/inf coordinate fed to a camera native is an
+        -- instant hard crash (not a catchable Lua error). If the killer's
+        -- position can't be read cleanly we skip the camera entirely and just
+        -- show the NUI banner.
+        local function finite(n) return n == n and n ~= math.huge and n ~= -math.huge end
+        -- This run's own camera, so finish() can always reclaim it.
+        local cam = nil
+        -- Teardown has two independent halves, and merging them was the leak:
+        --
+        --   our camera  — ALWAYS destroyed, no matter what else has happened.
+        --                 Previously this was gated behind the generation
+        --                 check, so if destroyKillCam() ran in the window
+        --                 between capturing myGen and CreateCam below, this
+        --                 thread created a camera and then refused to destroy
+        --                 it. killCamHandle was overwritten by the next death,
+        --                 so nothing could ever reclaim it: one camera leaked
+        --                 per death until the pool was full.
+        --
+        --   shared state — only touched while this run is still current, so a
+        --                 thread winding down can't clobber a newer kill cam.
+        local function finish()
+            if cam ~= nil then
+                if killCamHandle == cam then RenderScriptCams(false, false, 0, true, true) end
+                dropCam(cam)
+                cam = nil
+            end
+            if myGen == killCamGen then destroyKillCam() end
+        end
+        local function killerCoords()
+            if not DoesEntityExist(killer) then return nil end
+            local c = GetEntityCoords(killer)
+            if not (finite(c.x) and finite(c.y) and finite(c.z)) then return nil end
+            return c
+        end
+
+        local start = killerCoords()
+        if not start then
+            -- No safe position — banner only, no scripted camera.
+            local t0 = GetGameTimer()
+            while killCamActive and myGen == killCamGen and (GetGameTimer() - t0) < camDur do Wait(100) end
+            finish()
+            return
+        end
+
+        -- Point the camera AT A COORDINATE, never at a raw entity handle:
+        -- PointCamAtEntity on another player's ped that isn't fully networked
+        -- locally can crash. PointCamAtCoord is safe with validated numbers.
+        cam = makeCam('kill')
+        if cam == nil then
+            -- Camera pool exhausted (another resource leaking cams, or a very
+            -- busy scene). Fall back to the banner instead of driving natives
+            -- against an invalid handle, which is a hard crash.
+            RZDbg('killcam: CreateCam failed — banner only')
+            local t0 = GetGameTimer()
+            while killCamActive and myGen == killCamGen and (GetGameTimer() - t0) < camDur do Wait(100) end
+            finish()
+            return
+        end
+        killCamHandle = cam
+        local function place()
+            -- Re-validated every frame: destroyKillCam can run from another
+            -- thread (revive, respawn, resource stop) between our Wait(0) and
+            -- this call, and driving a destroyed cam handle crashes the game.
+            if not (killCamActive and killCamHandle == cam and DoesCamExist(cam)) then return false end
+            local c = killerCoords() or start
+            local rad = math.rad(GetEntityHeading(killer))
+            local camX = c.x + math.sin(rad) * 2.6
+            local camY = c.y - math.cos(rad) * 2.6
+            local camZ = c.z + 1.2
+            if finite(camX) and finite(camY) and finite(camZ) then
+                SetCamCoord(cam, camX, camY, camZ)
+                PointCamAtCoord(cam, c.x, c.y, c.z + 0.2)
+            end
+            return true
+        end
+        place()
+        SetCamActive(cam, true)
+        RenderScriptCams(true, false, 0, true, true)
+        local t = GetGameTimer()
+        while killCamActive and myGen == killCamGen
+              and (GetGameTimer() - t) < camDur and DoesEntityExist(killer) do
+            Wait(0)
+            if not place() then break end
+        end
+        finish()
+    end)
+end
+
 local function ZoneHasPoly(z)
     return type(z.poly) == 'table' and #z.poly >= 3
 end
@@ -53,32 +351,48 @@ end
 -- transparency — the same look as the circular dome, not a debug outline.
 -- Each wall is two triangles drawn in both winding orders so it's visible
 -- from either side.
-local function DrawPolyWalls(z)
+-- Wall geometry is FIXED per zone, so all vertex math is done ONCE at sync
+-- (BuildZoneTris) into a flat number array; the per-frame path below just
+-- feeds cached numbers to DrawPoly/DrawLine. This was a large slice of the
+-- old resmon cost: per-frame table indexing + math for every wall.
+function BuildZoneTris(z)
+    if not (type(z.poly) == 'table' and #z.poly >= 3) then z._tris, z._lines = nil, nil return end
     local n = #z.poly
     local baseZ = z.polyMinZ or (z.vec.z - 2.0)
     local topZ  = z.polyMaxZ or (baseZ + 6.0)
-    local r, g, b = z._r, z._g, z._b
-    -- colorA drives the dome's translucency; reuse it here, clamped so the
-    -- walls never turn into an opaque box or vanish entirely.
-    local a = math.max(20, math.min(160, z._a or 80))
-    local edgeA = math.min(110, a + 30)
+    local tris, lines = {}, {}
+    local ti, li = 0, 0
     for i = 1, n do
         local p1 = z.poly[i]
         local p2 = z.poly[i % n + 1]
-        -- Each wall = a quad = two triangles. DrawPoly is SINGLE-SIDED (only
-        -- the side whose vertices wind counter-clockwise toward the camera is
-        -- drawn), so every triangle is drawn in BOTH windings. Without the
-        -- reversed copies, walls facing away from the camera vanish — which is
-        -- why part of the box wasn't showing.
-        -- Triangle 1: bottom-left, bottom-right, top-right
-        DrawPoly(p1.x, p1.y, baseZ, p2.x, p2.y, baseZ, p2.x, p2.y, topZ, r, g, b, a)
-        DrawPoly(p2.x, p2.y, topZ,  p2.x, p2.y, baseZ, p1.x, p1.y, baseZ, r, g, b, a) -- reverse
-        -- Triangle 2: bottom-left, top-right, top-left
-        DrawPoly(p1.x, p1.y, baseZ, p2.x, p2.y, topZ, p1.x, p1.y, topZ, r, g, b, a)
-        DrawPoly(p1.x, p1.y, topZ,  p2.x, p2.y, topZ, p1.x, p1.y, baseZ, r, g, b, a) -- reverse
-        -- Soft base + top edge so the boundary reads without a bright wireframe.
-        DrawLine(p1.x, p1.y, baseZ, p2.x, p2.y, baseZ, r, g, b, edgeA)
-        DrawLine(p1.x, p1.y, topZ,  p2.x, p2.y, topZ,  r, g, b, math.floor(edgeA * 0.6))
+        -- Quad = 2 triangles, each in BOTH windings (DrawPoly is single-sided).
+        local quads = {
+            p1.x,p1.y,baseZ, p2.x,p2.y,baseZ, p2.x,p2.y,topZ,
+            p2.x,p2.y,topZ,  p2.x,p2.y,baseZ, p1.x,p1.y,baseZ,
+            p1.x,p1.y,baseZ, p2.x,p2.y,topZ,  p1.x,p1.y,topZ,
+            p1.x,p1.y,topZ,  p2.x,p2.y,topZ,  p1.x,p1.y,baseZ,
+        }
+        for k = 1, #quads do ti = ti + 1 tris[ti] = quads[k] end
+        local seg = { p1.x,p1.y,baseZ, p2.x,p2.y,baseZ, p1.x,p1.y,topZ, p2.x,p2.y,topZ }
+        for k = 1, #seg do li = li + 1 lines[li] = seg[k] end
+    end
+    z._tris, z._lines = tris, lines
+end
+
+local function DrawPolyWalls(z)
+    local t = z._tris
+    if not t then BuildZoneTris(z) t = z._tris if not t then return end end
+    local r, g, b = z._r, z._g, z._b
+    local a = math.max(20, math.min(160, z._a or 80))
+    local edgeA = math.min(110, a + 30)
+    local edgeA2 = math.floor(edgeA * 0.6)
+    for i = 1, #t, 9 do
+        DrawPoly(t[i],t[i+1],t[i+2], t[i+3],t[i+4],t[i+5], t[i+6],t[i+7],t[i+8], r, g, b, a)
+    end
+    local L = z._lines
+    for i = 1, #L, 12 do
+        DrawLine(L[i],L[i+1],L[i+2], L[i+3],L[i+4],L[i+5], r, g, b, edgeA)
+        DrawLine(L[i+6],L[i+7],L[i+8], L[i+9],L[i+10],L[i+11], r, g, b, edgeA2)
     end
 end
 
@@ -258,8 +572,19 @@ local tabletAnimGen = 0 -- bumps on every open/close so a slow loader can tell
 AddEventHandler('onResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
     SetNuiFocus(false, false)
+    -- Cameras survive a resource restart, so anything still live here would be
+    -- leaked permanently — a restart-to-fix loop is how these accumulate.
+    RenderScriptCams(false, false, 0, true, true)
+    reapCams()
     placing = nil
-    if tabletProp and DoesEntityExist(tabletProp) then DeleteEntity(tabletProp) end
+    if tabletProp and DoesEntityExist(tabletProp) then
+        DetachEntity(tabletProp, true, true)
+        if not NetworkHasControlOfEntity(tabletProp) then NetworkRequestControlOfEntity(tabletProp) end
+        SetEntityAsMissionEntity(tabletProp, true, true)
+        DeleteEntity(tabletProp)
+        if DoesEntityExist(tabletProp) then DeleteObject(tabletProp) end
+    end
+    tabletProp = nil
     EnableAllControlActions(0)
     EnableAllControlActions(1)
     EnableAllControlActions(2)
@@ -276,6 +601,9 @@ CreateThread(function()
         local ok, p = pcall(json.decode, rawC)
         if ok and p and p.hex then
             personalColor = p
+            -- Old saves may lack .a — a nil alpha into DrawMarker is a hard
+            -- error that kills the render thread (zone visuals vanish).
+            personalColor.a = math.max(0, math.min(255, math.floor(tonumber(p.a) or 80)))
             personalColor._r, personalColor._g, personalColor._b = HexToRGB(p.hex)
         end
     end
@@ -324,9 +652,27 @@ local function BuildBlips()
 end
 
 local DynRenderDist = nil
-local Opts = {}
+RegisterNetEvent('lime_redzones:client:syncOptions', function(o)
+    Opts = o or {}
+    RZ_DEBUG_SERVER = Opts.debugMode == true
+    resolveDebug()
+    -- Push the admin's global theme to the UI on every options sync (incl. the
+    -- initial one on join) so the HUD and tablet carry the custom accent
+    -- immediately, without waiting for the tablet to be opened.
+    if type(Opts.customTheme) == 'table' then
+        SendNUIMessage({ type = 'tablet', customTheme = Opts.customTheme })
+    end
+end)
 
-RegisterNetEvent('lime_redzones:client:syncOptions', function(o) Opts = o or {} end)
+-- Global theme builder push. Update the cached option and tell the UI to
+-- recolour immediately — the HUD/kill feed are always mounted, so this
+-- repaints them live without needing the tablet open.
+RegisterNetEvent('lime_redzones:client:syncCustomTheme', function(theme)
+    if type(theme) == 'table' then
+        Opts.customTheme = theme
+        SendNUIMessage({ type = 'tablet', customTheme = theme, hudTheme = Opts.hudDefaultTheme or 'lime' })
+    end
+end)
 
 RegisterNetEvent('lime_redzones:client:syncZones', function(zones, renderDist)
     DynRenderDist = tonumber(renderDist)
@@ -346,6 +692,7 @@ RegisterNetEvent('lime_redzones:client:syncZones', function(zones, renderDist)
         else
             z._weapSet = nil
         end
+        BuildZoneTris(z)
     end
     BuildBlips()
 end)
@@ -365,6 +712,16 @@ local function UpdateHUD()
         return
     end
     local z = Zones[currentZoneId]
+    if not z then
+        SendNUIMessage({ type = 'updateRedzoneUI', display = false })
+        return
+    end
+    -- Per-zone: hide the on-screen kills/deaths blade while the zone still
+    -- works normally (kills, rewards, revives all unaffected).
+    if z.hideHud == true then
+        SendNUIMessage({ type = 'updateRedzoneUI', display = false })
+        return
+    end
     local nr = NextStreakReward(z, killStreak)
     SendNUIMessage({
         type = 'updateRedzoneUI', display = true,
@@ -373,12 +730,149 @@ local function UpdateHUD()
     })
 end
 
-local TABLET_DICT = 'amb@code_human_in_bus_passenger_idles@female@tablet@base'
+-- Death → revive detection. Runs EVERY loop pass, independent of the render
+-- branch: previously this lived inside the "near a zone / drawing" branch, so
+-- if death nudged the cached distance past render range (ragdoll, death-cam,
+-- a framework yank) the loop fell into the "far" branch, currentZoneId was
+-- cleared, and the death — and its revive — were never registered. That was
+-- the intermittent "revive doesn't work" bug.
+local function CheckDeath(ped)
+    local dead = isDownedOrDead(ped)
+    if currentZoneId and dead and not wasDead then
+        wasDead = true
+        -- Arm the debounce fresh for this death. Without this it still holds a
+        -- timestamp from however long the player was alive before dying, so the
+        -- very first not-downed flicker would already satisfy the grace period
+        -- and cancel the revive instantly.
+        upSince = nil
+        downedSince = GetGameTimer()
+        deaths = deaths + 1
+        killStreak = 0
+        UpdateHUD()
+        TriggerServerEvent('lime_redzones:server:reportDeath', currentZoneId)
+        local z = Zones[currentZoneId]
+        if z then
+            local exit
+            local exits = z.exits
+            if type(exits) == 'table' and #exits > 0 then
+                -- Placed deliberately by an admin (rooftop, interior, balcony),
+                -- so the height is meant literally: exact = do not ground-snap.
+                local e = exits[math.random(#exits)]
+                exit = { x = e.x, y = e.y, z = e.z, exact = true }
+            else
+                -- Fallback ring around the zone. The Z here is the ZONE CENTRE's
+                -- height applied to a point 30m+ outside it, which is simply the
+                -- wrong height on any terrain that isn't flat — it can be metres
+                -- underground or in mid-air. Flagged inexact so the teleport
+                -- snaps it to the real ground once the map has streamed in.
+                local away = (z.teleportAway or 30.0) + z.radius
+                local ang = math.random() * 6.28318
+                exit = { x = z.coords.x + math.cos(ang) * away, y = z.coords.y + math.sin(ang) * away,
+                         z = z.coords.z, exact = false }
+            end
+            reviveRequest = { zone = currentZoneId, exit = exit, at = GetGameTimer() + (z.reviveDelay or 8000) }
+            if type(LimeReviveLockedOut) == 'function' and LimeReviveLockedOut() then
+                reviveRequest = nil
+                RZDbg('death registered but revive suppressed (loop lockout)')
+            else
+                RZDbg('death detected in zone '..tostring(currentZoneId)..' — revive queued (delay '..tostring(z.reviveDelay or 8000)..'ms) | '
+                    .. (type(LimeDownedWhy) == 'function' and LimeDownedWhy() or ''))
+            end
+        end
+        RunKillCam(ped)
+    elseif wasDead then
+        -- Reset ONLY once the player is CONFIRMED up — see confirmedUp(). A
+        -- single not-downed frame is not enough: it cancelled the queued revive
+        -- mid-death, which is exactly the "revives the first time, not the
+        -- second" bug. Resetting too eagerly is also what used to re-arm this
+        -- check every pass, firing a fresh kill cam + reportDeath each time and
+        -- flooding the camera pool.
+        if confirmedUp(ped) then
+            wasDead = false
+            -- Full teardown, not just the flag. Clearing the flag alone left
+            -- our scripted camera rendering for up to a frame while the
+            -- ambulance job was restoring its own camera on revive — two
+            -- resources driving RenderScriptCams against each other.
+            destroyKillCam()
+            reviveRequest = nil
+            reviveDispatchedAt = nil
+            downedSince = nil
+            RZDbg('death state cleared — ready for next death | '
+                .. (type(LimeDownedWhy) == 'function' and LimeDownedWhy() or ''))
+        end
+    end
+end
+
+-- Tablet-in-hand animation while the panel is open. Optional (Options tab),
+-- skipped when dead or in a vehicle where the pose looks broken.
+--
+-- All stock GTA dictionaries — nothing custom is streamed. Tried in order, so
+-- if the first fails to stream (busy scene, slow disk) the pose still plays
+-- instead of the player standing empty-handed holding a floating tablet.
+-- These are all upper-body idles, so they read correctly on any ped and the
+-- player can still walk around.
+local TABLET_ANIMS = {
+    { dict = Config.TabletAnimDict or 'amb@code_human_in_bus_passenger_idles@female@tablet@base',
+      name = Config.TabletAnimName or 'base' },
+    { dict = 'amb@world_human_tourist_map@male@base',      name = 'base' },
+    { dict = 'amb@world_human_seat_wall_tablet@female@base', name = 'base' },
+}
+-- AF_LOOPING(1) + AF_UPPERBODY(16) + AF_SECONDARY(32).
+-- The old value was 50 = AF_HOLD_LAST_FRAME(2) + 16 + 32, with no LOOPING bit.
+-- A -1 duration with no loop flag plays the idle ONCE and freezes on its last
+-- frame, which is why the pose looked dead the moment it settled.
+local TABLET_ANIM_FLAGS = 49
+
+local tabletAnim = nil   -- the entry from TABLET_ANIMS that actually loaded
+
+local function loadAnimDict(dict)
+    if HasAnimDictLoaded(dict) then return true end
+    RequestAnimDict(dict)
+    -- BOUNDED. This was `while not HasAnimDictLoaded(d) do Wait(0) end` — an
+    -- unbounded spin, so a dictionary that never streamed hung the thread at
+    -- Wait(0) forever and the prop was never attached.
+    local tries = 0
+    while not HasAnimDictLoaded(dict) and tries < 100 do
+        Wait(10)
+        tries = tries + 1
+    end
+    return HasAnimDictLoaded(dict)
+end
+
+local function resolveTabletAnim()
+    if tabletAnim and HasAnimDictLoaded(tabletAnim.dict) then return tabletAnim end
+    for _, a in ipairs(TABLET_ANIMS) do
+        if loadAnimDict(a.dict) then tabletAnim = a return a end
+    end
+    return nil
+end
+
+local function playTabletAnim(ped)
+    local a = tabletAnim
+    if not a then return end
+    if not IsEntityPlayingAnim(ped, a.dict, a.name, 3) then
+        TaskPlayAnim(ped, a.dict, a.name, 3.0, 3.0, -1, TABLET_ANIM_FLAGS, 0, false, false, false)
+    end
+end
+
+local function stopTabletAnim(ped)
+    local a = tabletAnim
+    if a then StopAnimTask(ped, a.dict, a.name, 2.0) end
+    ClearPedSecondaryTask(ped)
+end
 
 local function clearTabletProp()
     if tabletProp and DoesEntityExist(tabletProp) then
         DetachEntity(tabletProp, true, true)
+        -- Networked objects won't delete unless we own them and they're flagged
+        -- as a mission entity — otherwise the handle lingers and the object pool
+        -- fills up over repeated opens ("Pool Full, Size == 256").
+        if not NetworkHasControlOfEntity(tabletProp) then
+            NetworkRequestControlOfEntity(tabletProp)
+        end
+        SetEntityAsMissionEntity(tabletProp, true, true)
         DeleteEntity(tabletProp)
+        if DoesEntityExist(tabletProp) then DeleteObject(tabletProp) end
     end
     tabletProp = nil
 end
@@ -387,21 +881,21 @@ local function SetTabletAnim(on)
     local ped = PlayerPedId()
     tabletAnimGen = tabletAnimGen + 1
     local myGen = tabletAnimGen
-
     if on then
         if Opts.tabletAnim == false then return end
         if IsEntityDead(ped) or IsPedInAnyVehicle(ped, true) then return end
         CreateThread(function()
-            RequestAnimDict(TABLET_DICT)
-            
-            local wantName = 'limeredzones_prop'
-            local model = GetHashKey(wantName)
-            local isFallback = false
+            resolveTabletAnim()
 
+            -- Default GTA tablet (prop_cs_tablet). Stock model, always available
+            -- on every client, so nothing custom is streamed and there's no ytd/
+            -- ytyp to load or leak.
+            local wantName = Config.TabletProp or 'prop_cs_tablet'
+            local model = GetHashKey(wantName)
             RequestModel(model)
-            
+
             local tries = 0
-            while not HasModelLoaded(model) and tries < 300 do
+            while not HasModelLoaded(model) and tries < 100 do
                 Wait(10)
                 tries = tries + 1
                 if myGen ~= tabletAnimGen then
@@ -409,59 +903,82 @@ local function SetTabletAnim(on)
                     return
                 end
             end
-
-            if not HasModelLoaded(model) then
-                model = GetHashKey('prop_cs_tablet')
-                isFallback = true
-                RequestModel(model)
-                while not HasModelLoaded(model) do Wait(0) end
-            end
-
-            if myGen ~= tabletAnimGen or not tabletOpen then
+            if myGen ~= tabletAnimGen or not tabletOpen or not HasModelLoaded(model) then
                 SetModelAsNoLongerNeeded(model)
                 return
             end
 
             ped = PlayerPedId()
-            RequestAnimDict(TABLET_DICT)
-            while not HasAnimDictLoaded(TABLET_DICT) do Wait(0) end
-            
-            TaskPlayAnim(ped, TABLET_DICT, 'base', 3.0, 3.0, -1, 50, 0, false, false, false)
+            playTabletAnim(ped)
 
+            -- Ensure no orphan prop survives before making a new one, and the
+            -- generation guard below means at most one exists per client.
             clearTabletProp()
-            
             local boneCoords = GetPedBoneCoords(ped, 28422, 0.0, 0.0, 0.0)
-            tabletProp = CreateObject(model, boneCoords.x, boneCoords.y, boneCoords.z, true, true, false)
-            
-            while not DoesEntityExist(tabletProp) do Wait(0) end
-            
+            -- Local object (not networked): it's a cosmetic stock prop only you
+            -- need to see, so it never touches the networked entity pool. Stock
+            -- GTA props don't suffer the OneSync culling that made the custom
+            -- streamed model vanish, so local is both safe and pool-free here.
+            tabletProp = CreateObject(model, boneCoords.x, boneCoords.y, boneCoords.z, false, false, false)
+
+            local waitExist = 0
+            while not DoesEntityExist(tabletProp) and waitExist < 50 do Wait(0); waitExist = waitExist + 1 end
+            if not DoesEntityExist(tabletProp) then tabletProp = nil; SetModelAsNoLongerNeeded(model); return end
+
             SetEntityCollision(tabletProp, false, false)
             SetEntityVisible(tabletProp, true, false)
             SetEntityAlpha(tabletProp, 255, false)
             ResetEntityAlpha(tabletProp)
-            
-            local bone = GetPedBoneIndex(ped, 28422) -- SKEL_R_Hand
-            
-            local offX, offY, offZ, rotX, rotY, rotZ
-            if isFallback then
-                offX, offY, offZ = 0.0, -0.03, 0.0
-                rotX, rotY, rotZ = 20.0, -90.0, 0.0
-            else
-                -- INTEGRATED YOUR PROVIDED CONFIGURATION SETTINGS
-                offX, offY, offZ = 0.05, -0.005, -0.04
-                rotX, rotY, rotZ = 0.0, 180.0, 0.0
-            end
-            
-            AttachEntityToEntity(tabletProp, ped, bone,
-                offX, offY, offZ, rotX, rotY, rotZ, 
-                true, false, false, false, 2, true)
 
+            local bone = GetPedBoneIndex(ped, 28422) -- SKEL_R_Hand
+            -- Stock GTA tablet offsets (the default prop_cs_tablet).
+            local offX, offY, offZ = 0.0, -0.03, 0.0
+            local rotX, rotY, rotZ = 20.0, -90.0, 0.0
+            AttachEntityToEntity(tabletProp, ped, bone,
+                offX, offY, offZ, rotX, rotY, rotZ,
+                true, false, false, false, 2, true)
             SetModelAsNoLongerNeeded(model)
+
+            -- Closed during the load/attach window: tear back down.
+            if myGen ~= tabletAnimGen or not tabletOpen then
+                stopTabletAnim(ped)
+                clearTabletProp()
+                return
+            end
+
+            -- Keep-alive. The animation was played once and never checked
+            -- again, so anything that cleared the ped's tasks — walking,
+            -- sprinting, taking a hit, another resource calling
+            -- ClearPedTasks — ended the pose for good while the tablet stayed
+            -- glued to a limp hand for the rest of the session. Re-applies the
+            -- pose and re-attaches the prop whenever either has dropped, and
+            -- exits the moment this open is superseded.
+            while tabletOpen and myGen == tabletAnimGen do
+                Wait(500)
+                if not (tabletOpen and myGen == tabletAnimGen) then break end
+                local p = PlayerPedId()
+                if IsEntityDead(p) or IsPedInAnyVehicle(p, true) then
+                    -- Pose looks broken here; drop it and pick back up on exit.
+                    stopTabletAnim(p)
+                else
+                    playTabletAnim(p)
+                    -- A respawn swaps the ped, which silently detaches the prop.
+                    if tabletProp and DoesEntityExist(tabletProp)
+                       and not IsEntityAttachedToEntity(tabletProp, p) then
+                        AttachEntityToEntity(tabletProp, p, GetPedBoneIndex(p, 28422),
+                            offX, offY, offZ, rotX, rotY, rotZ,
+                            true, false, false, false, 2, true)
+                    end
+                end
+            end
         end)
     else
-        StopAnimTask(ped, TABLET_DICT, 'base', 2.0)
-        ClearPedSecondaryTask(ped)
+        stopTabletAnim(ped)
         clearTabletProp()
+        -- Release the streaming request. RequestAnimDict was called on every
+        -- open with no matching release, so the dict stayed pinned in memory
+        -- for the whole session.
+        if tabletAnim then RemoveAnimDict(tabletAnim.dict) end
     end
 end
 
@@ -488,6 +1005,7 @@ local function SetTablet(open, mode, tab, payload)
         personalColor = personalColor,
         options = Opts,
         hudTheme = GetResourceKvpString('rz_hud_theme') or (Opts.hudDefaultTheme or 'lime'),
+        customTheme = Opts.customTheme,
         hudPreset = GetResourceKvpString('rz_hud_preset') or (Opts.hudDefaultPreset or 'top'),
         hudScale = tonumber(GetResourceKvpFloat('rz_hud_scale')) or 1.0,
         tabletScale = tonumber(GetResourceKvpFloat('rz_tablet_scale')) or 1.0,
@@ -571,27 +1089,60 @@ RegisterNetEvent('lime_redzones:client:myIdentifier', function(lic, id)
     SendNUIMessage({ type = 'myIdentifier', license = lic, identifier = id })
 end)
 
--- Drives pending respawn requests. Cheap: sleeps 500ms and does nothing at all
--- unless a request is actually outstanding.
+-- Drives pending respawn requests. Cheap: does nothing at all unless a request
+-- is actually outstanding. Polled at 200ms so a zone's configured revive delay
+-- is honoured closely — at 500ms a 3s delay could land at 3.5s, which reads as
+-- the revive being slow when it was just the poll interval.
 CreateThread(function()
     while true do
-        Wait(500)
+        Wait(200)
         local r = reviveRequest
         if r then
             local ped = PlayerPedId()
-            -- Alive again (by our hand or an admin/medic) — nothing left to do.
-            if not IsEntityDead(ped) and not IsPedDeadOrDying(ped, true) then
+            -- Confirmed up (see confirmedUp) — clear all death state. This has
+            -- to be the debounced check, not a raw one: the not-downed flicker
+            -- during a death system's own sequence would otherwise delete the
+            -- pending request here too, before it ever got a chance to fire.
+            -- It must also never be a bare native-alive check — laststand
+            -- leaves the ped natively alive while still down, and resetting on
+            -- that re-armed CheckDeath every pass, firing a fresh kill cam each
+            -- time until the camera pool overflowed ("Pool Full, Size == 256").
+            if confirmedUp(ped) then
                 reviveRequest = nil
-            elseif GetGameTimer() >= r.at then
-                -- Server rate-limits revives at 8s; space retries wider than
-                -- that so a retry can't be swallowed by the limiter.
-                r.at = GetGameTimer() + 9000
-                r.tries = (r.tries or 0) + 1
-                if r.tries > 6 then
+                wasDead = false
+                destroyKillCam()
+            -- Retry only while actually down. During the grace window the
+            -- player reads as up but isn't confirmed yet — retrying there would
+            -- fire a second revive at someone who has just been revived.
+            elseif isDownedOrDead(ped) and GetGameTimer() >= r.at then
+                -- Lockout: the bridge detected our revive fighting an unknown
+                -- death system (revive → re-down loop). Stop requesting — the
+                -- player uses the server's own respawn flow until it clears.
+                if type(LimeReviveLockedOut) == 'function' and LimeReviveLockedOut() then
                     reviveRequest = nil
-                    Notify(_U('revive_failed'), 'error')
+                    RZDbg('revive request dropped (loop lockout active)')
+                -- Don't restart the revive chain if one is already running from
+                -- a previous attempt — re-firing attemptRevive re-triggers the
+                -- whole server→client revive path (extra threads + resurrects),
+                -- which is what accumulated across a slow revive and crashed the
+                -- game on the third death. Push the next check out and wait.
+                elseif type(LimeReviveInProgress) == 'function' and LimeReviveInProgress() then
+                    r.at = GetGameTimer() + 2000
                 else
-                    TriggerServerEvent('lime_redzones:server:attemptRevive', r.zone, r.exit, 0.0)
+                    -- Retry cadence: wider than the server's 3s limiter so a
+                    -- retry can't be swallowed, but not so wide the player waits
+                    -- ages between attempts.
+                    r.at = GetGameTimer() + 4000
+                    r.tries = (r.tries or 0) + 1
+                    if r.tries > 6 then
+                        reviveRequest = nil
+                        reviveDispatchedAt = reviveDispatchedAt or GetGameTimer()
+                        Notify(_U('revive_failed'), 'error')
+                    else
+                        reviveDispatchedAt = reviveDispatchedAt or GetGameTimer()
+                        RZDbg('attemptRevive sent (try '..tostring(r.tries)..') zone '..tostring(r.zone))
+                        TriggerServerEvent('lime_redzones:server:attemptRevive', r.zone, r.exit, 0.0)
+                    end
                 end
             end
         end
@@ -606,25 +1157,38 @@ end)
 
 RegisterNetEvent('lime_redzones:client:teleportTo', function(coords, name, exact)
     if not coords then return end
+    RZDbg('teleportTo received')
     local ped = PlayerPedId()
     SetTablet(false)
+    -- End any active kill cam before we fade + teleport, so its render thread
+    -- can't keep a scripted camera alive across the revive.
+    destroyKillCam()
 
     CreateThread(function()
         DoScreenFadeOut(400)
-        while not IsScreenFadedOut() do Wait(10) end
+        -- Bounded: if another resource cancels the fade (a death screen doing
+        -- its own transition is the usual culprit) this waited forever and the
+        -- player was left frozen mid-teleport with no way out.
+        local fadeWait = 0
+        while not IsScreenFadedOut() and fadeWait < 2000 do Wait(10) fadeWait = fadeWait + 10 end
 
         local veh = GetVehiclePedIsIn(ped, false)
         local ent = (veh ~= 0 and GetPedInVehicleSeat(veh, -1) == ped) and veh or ped
 
-        -- Request the collision volume first, otherwise the player can land
-        -- under the map before the ground streams in.
-        SetEntityCoordsNoOffset(ent, coords.x, coords.y, coords.z, false, false, false)
+        -- SetEntityCoords rather than the NoOffset variant: the engine applies
+        -- its own placement correction instead of forcing the ped to a literal
+        -- coordinate that may be inside geometry.
+        SetEntityCoords(ent, coords.x, coords.y, coords.z, false, false, false, false)
+
+        -- Collision requested ONCE, then polled. Re-issuing the request on
+        -- every 10ms iteration queued up to 100 streaming requests per
+        -- teleport; in an MLO-dense area that queue cannot drain, and a few
+        -- teleports exhausted the streamer and hard-crashed the client.
         RequestCollisionAtCoord(coords.x, coords.y, coords.z)
-        local tries = 0
-        while not HasCollisionLoadedAroundEntity(ent) and tries < 100 do
-            RequestCollisionAtCoord(coords.x, coords.y, coords.z)
-            Wait(10)
-            tries = tries + 1
+        local waited = 0
+        while not HasCollisionLoadedAroundEntity(ent) and waited < 3000 do
+            Wait(50)
+            waited = waited + 50
         end
 
         -- Only snap to ground when using the zone centre as a fallback. A
@@ -632,7 +1196,7 @@ RegisterNetEvent('lime_redzones:client:teleportTo', function(coords, name, exact
         -- balcony), so snapping it down would move it off the intended spot.
         if not exact then
             local found, groundZ = GetGroundZFor_3dCoord(coords.x, coords.y, coords.z + 10.0, false)
-            if found then SetEntityCoordsNoOffset(ent, coords.x, coords.y, groundZ, false, false, false) end
+            if found then SetEntityCoords(ent, coords.x, coords.y, groundZ, false, false, false, false) end
         end
 
         if coords.h then SetEntityHeading(ent, coords.h + 0.0) end
@@ -659,9 +1223,6 @@ end
 
 RegisterCommand('leaderboard', function() OpenPlayerTablet('leaderboard') end, false)
 RegisterCommand('rz', function() OpenPlayerTablet('leaderboard') end, false)
-if Config.LeaderboardKeybindEnabled ~= false then
-    RegisterKeyMapping('leaderboard', 'Toggle Redzone Leaderboard', 'keyboard', Config.LeaderboardKey or 'F1')
-end
 
 RegisterCommand('rz_admin', function()
     if tabletOpen and tabletMode == 'admin' then SetTablet(false)
@@ -670,6 +1231,31 @@ end, false)
 
 RegisterCommand('rz_color', function() OpenPlayerTablet('color') end, false)
 RegisterCommand('rz_hud', function() SetHudMove(not hudMoveMode) end, false)
+
+-- Keybinds. RegisterKeyMapping must run at startup and can't be changed live,
+-- so we read the admin-configured defaults (server option) with a short wait
+-- for the first sync, then fall back to Config. Which key a player actually
+-- uses is theirs to rebind in GTA Settings once registered; these only set the
+-- default and whether the bind exists at all. Changes apply next restart.
+CreateThread(function()
+    -- Give syncOptions a moment to land so panel-set keys win over Config.
+    local waited = 0
+    while (type(Opts) ~= 'table' or Opts.keybinds == nil) and waited < 3000 do
+        Wait(100); waited = waited + 100
+    end
+    local kb = (type(Opts) == 'table' and Opts.keybinds) or {}
+    local function bind(cmd, label, cfgEnabled, cfgKey, optName)
+        local o = kb[optName]
+        local enabled = (o ~= nil) and (o.enabled == true) or (o == nil and cfgEnabled ~= false)
+        local key = (o and o.key) or cfgKey or 'F1'
+        if enabled then
+            RegisterKeyMapping(cmd, label, 'keyboard', key)
+        end
+    end
+    bind('leaderboard', 'Toggle Redzone Leaderboard', Config.LeaderboardKeybindEnabled, Config.LeaderboardKey, 'leaderboard')
+    bind('rz_admin',    'Open Redzone Admin Panel',    Config.AdminKeybindEnabled,       Config.AdminKey,       'admin')
+    bind('rz_hud',      'Move Redzone HUD',            Config.HudMoveKeybindEnabled,     Config.HudMoveKey,     'hudMove')
+end)
 
 -- Forward NUI data straight to a server event.
 local function forward(name, event, arg)
@@ -815,6 +1401,9 @@ end)
 RegisterNUICallback('saveOptions', function(d, cb)
     TriggerServerEvent('lime_redzones:server:saveOptions', d) cb({})
 end)
+RegisterNUICallback('saveCustomTheme', function(d, cb)
+    TriggerServerEvent('lime_redzones:server:saveCustomTheme', d) cb({})
+end)
 
 RegisterNUICallback('saveHudPos', function(d, cb)
     if type(d.x) == 'number' and type(d.y) == 'number' then
@@ -927,9 +1516,32 @@ local function RunPolyFreecam(draft)
     local speed = 1.0
 
     local lastHit = nil
-    local camPos = vector3(start.x, start.y, start.z + 18.0)
+    local rayHandle = nil   -- one async shape test in flight at a time
+    -- Editing an existing shape: start the camera above its centroid, not at
+    -- the player — otherwise editing a zone drawn across the map opens the
+    -- freecam staring at nothing.
+    local camPos
+    if #points >= 1 then
+        local cx, cy = 0.0, 0.0
+        for i = 1, #points do cx = cx + points[i].x; cy = cy + points[i].y end
+        cx, cy = cx / #points, cy / #points
+        camPos = vector3(cx, cy, maxZ + 22.0)
+    else
+        camPos = vector3(start.x, start.y, start.z + 18.0)
+    end
     local rotX, rotZ = -35.0, GetEntityHeading(ped)
-    local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    -- Registered as live so it is reclaimable from outside this function. The
+    -- editor runs under pcall, and on error the handler at the call site could
+    -- only reset RenderScriptCams — `cam` is a local, so the camera itself was
+    -- unreachable and leaked on every shape-editor error.
+    local cam = makeCam('editor')
+    if cam == nil then
+        -- Camera pool is full. Bail with a clear message instead of driving
+        -- natives against a nil handle for the whole editing session.
+        Notify('Cannot open the shape editor — the game camera pool is full. Rejoin and try again.', 'error')
+        hidePlacementBar()
+        return
+    end
     SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
     SetCamRot(cam, rotX, 0.0, rotZ, 2)
     RenderScriptCams(true, true, 400, true, true)
@@ -995,11 +1607,27 @@ local function RunPolyFreecam(draft)
         -- and the result often isn't ready on the frame the ray is started —
         -- both of which meant `cursor` was always nil and no point could be
         -- placed. Keep the previous frame's hit so the cursor stays steady.
-        local target = camPos + fwd * 2000.0
-        local ray = StartShapeTestRay(camPos.x, camPos.y, camPos.z, target.x, target.y, target.z, 1 + 16, 0, 7)
-        local _, hit, hitPos = GetShapeTestResult(ray)
-        if hit and hit ~= 0 and hitPos then
-            lastHit = vector3(hitPos.x, hitPos.y, hitPos.z)
+        --
+        -- LEAK: this used to start a brand new ray EVERY frame and read it
+        -- once. An async shape test only releases its slot once its result is
+        -- actually collected (status 2 = ready, 0 = invalid); status 1 means
+        -- still pending, and a pending test that is never read again holds its
+        -- slot forever. At 60fps that abandoned one slot per frame, so a few
+        -- seconds in the shape editor exhausted the shape-test pool and the
+        -- game hard-crashed with a pool-full error. Now: one test in flight,
+        -- and a new one only starts after the previous has resolved.
+        if rayHandle == nil then
+            local target = camPos + fwd * 2000.0
+            rayHandle = StartShapeTestRay(camPos.x, camPos.y, camPos.z,
+                target.x, target.y, target.z, 1 + 16, 0, 7)
+        else
+            local status, hit, hitPos = GetShapeTestResult(rayHandle)
+            if status ~= 1 then          -- 1 = still pending, keep waiting
+                rayHandle = nil
+                if hit and hit ~= 0 and hitPos then
+                    lastHit = vector3(hitPos.x, hitPos.y, hitPos.z)
+                end
+            end
         end
         local cursor = lastHit
 
@@ -1078,7 +1706,7 @@ local function RunPolyFreecam(draft)
     end
 
     RenderScriptCams(false, true, 400, true, true)
-    DestroyCam(cam, false)
+    dropCam(cam)
     FreezeEntityPosition(ped, false)
     SetEntityVisible(ped, true, false)
     EnableAllControlActions(0)
@@ -1202,6 +1830,7 @@ RegisterNUICallback('startPlacement', function(d, cb)
                 -- "nothing happened".
                 print('[lime_redzones] ^1shape editor ERROR:^0 ' .. tostring(err))
                 RenderScriptCams(false, false, 0, true, true)
+                reapCams('editor')   -- unreachable from here otherwise
                 local ped = PlayerPedId()
                 FreezeEntityPosition(ped, false)
                 SetEntityVisible(ped, true, false)
@@ -1349,10 +1978,22 @@ local function DespawnZoneNpcs(zoneId)
     spawnedNpcs[zoneId] = nil
     npcGen[zoneId] = (npcGen[zoneId] or 0) + 1
     for _, ped in ipairs(handles) do
+        -- Target entries are removed unconditionally, before the existence
+        -- check: only ox was being cleaned up, so qb-target/qtarget kept an
+        -- entry per ped for every spawn/despawn cycle as players moved in and
+        -- out of range — an unbounded table plus stale entries on recycled
+        -- ped handles.
+        if npcTargetLib == 'ox' then
+            pcall(function() exports.ox_target:removeLocalEntity(ped) end)
+        elseif npcTargetLib == 'qb' then
+            pcall(function() exports['qb-target']:RemoveTargetEntity(ped) end)
+        elseif npcTargetLib == 'qtarget' then
+            pcall(function() exports.qtarget:RemoveTargetEntity(ped) end)
+        end
         if DoesEntityExist(ped) then
-            if npcTargetLib == 'ox' then pcall(function() exports.ox_target:removeLocalEntity(ped) end) end
             SetEntityAsMissionEntity(ped, true, true)
             DeleteEntity(ped)
+            if DoesEntityExist(ped) then DeletePed(ped) end
         end
     end
 end
@@ -1366,11 +2007,17 @@ CreateThread(function()
                             and type(z.teleportNpcs) == 'table' and #z.teleportNpcs > 0
             if hasNpcs then
                 local d = #(pos - vector3(z.coords.x, z.coords.y, z.coords.z))
-                local within = d <= ((z.radius or 60.0) + 100.0)
-                if within and not spawnedNpcs[zoneId] then
+                -- Hysteresis: spawn at the inner edge, despawn 40m beyond it.
+                -- With a single threshold, standing near the boundary spawned
+                -- and despawned four peds every second — and a revive drops you
+                -- exactly there, since exit points sit just outside the zone.
+                -- Each cycle is 4x RequestModel + CreatePed + mission-entity
+                -- registration, which is how the entity pools filled up.
+                local base = (z.radius or 60.0) + 100.0
+                if spawnedNpcs[zoneId] then
+                    if d > base + 40.0 then DespawnZoneNpcs(zoneId) end
+                elseif d <= base then
                     SpawnZoneNpcs(zoneId, z)
-                elseif not within and spawnedNpcs[zoneId] then
-                    DespawnZoneNpcs(zoneId)
                 end
             elseif spawnedNpcs[zoneId] then
                 DespawnZoneNpcs(zoneId) -- zone deleted, disabled, or teleport/NPCs turned off
@@ -1429,12 +2076,21 @@ CreateThread(function()
     local nearest, nearestId, nDist = nil, nil, math.huge
     local safeZone, safeZoneId, safeDist = nil, nil, math.huge
     local nextScan = 0
-    while true do
+    -- One pass of the zone loop. Runs under pcall: an error in here used to
+    -- kill the whole thread silently — zone bubbles and detection just
+    -- disappeared until a resource restart (typically right after a death,
+    -- since the death path is the least-travelled code).
+    local function ZonePass()
         local renderDist = DynRenderDist or 120.0
-        if not next(Zones) then Wait(2500) goto continue end
+        if not next(Zones) then Wait(2500) return end
 
         local ped = PlayerPedId()
         local pos = GetEntityCoords(ped)
+
+        -- Death/revive is checked here, every pass, before any branch decides
+        -- how much to draw or how long to sleep — so it can never be skipped by
+        -- falling into the far-away branch after a death displaces the player.
+        CheckDeath(ped)
 
         local now = GetGameTimer()
         if now >= nextScan then
@@ -1464,7 +2120,9 @@ CreateThread(function()
             currentSafeId = safeZoneId
             TriggerServerEvent('lime_redzones:server:syncSafePresence', currentSafeId)
             ApplySafeState(safeZone)
-            SendNUIMessage({ type = 'safezone', display = true, name = safeZone.name, speedLimit = tonumber(safeZone.speedLimit) or 0 })
+            if safeZone.hideHud ~= true then
+                SendNUIMessage({ type = 'safezone', display = true, name = safeZone.name, speedLimit = tonumber(safeZone.speedLimit) or 0 })
+            end
             Notify(_U('entered_safezone', safeZone.name), 'success')
 
             -- Optional: remove the car on entry (default off — greenzones are
@@ -1493,7 +2151,11 @@ CreateThread(function()
         end
 
         if not nearest or nDist > (nearest.radius + renderDist) then
-            if currentZoneId then
+            -- Keep the zone association while dead with a pending revive — the
+            -- death displaced us out of range, but we're still "in" the zone
+            -- until the revive resolves. Dropping it here blanks the HUD and
+            -- can race the revive.
+            if currentZoneId and not (wasDead and reviveRequest) then
                 currentZoneId = nil
                 UpdateHUD()
             end
@@ -1511,7 +2173,9 @@ CreateThread(function()
                 ApplySafeTick(Zones[currentSafeId])
                 Wait(0)
             else
-                Wait(nDist > (nearest and nearest.radius or 0) + renderDist + 200.0 and 2000 or 1000)
+                -- Never sleep long while the player is still flagged inside a
+                -- zone — a death needs to be caught within a frame or two.
+                Wait(currentZoneId and 0 or (nDist > (nearest and nearest.radius or 0) + renderDist + 200.0 and 2000 or 1000))
             end
         else
             -- "Show zone visual" off = skip all drawing; the zone still works
@@ -1540,11 +2204,13 @@ CreateThread(function()
             -- With the visual hidden the loop sleeps ~300ms per pass, so the
             -- 30-frame cadence would take 9s to fire; run the checks every
             -- pass instead.
+            -- Death/downed is checked EVERY pass (cheap), independent of the
+            -- 30-frame cadence used for the heavier inside/entry logic — a
+            -- delayed death check meant the revive could be skipped entirely.
             frame = frame + (showVisual and 1 or 30)
             if frame >= 30 then
                 frame = 0
                 local inside = InsideZone(nearest, pos)
-                local dead   = IsEntityDead(ped)
 
                 if inside and currentZoneId ~= nearestId then
                     currentZoneId = nearestId
@@ -1586,110 +2252,9 @@ CreateThread(function()
                         end
                     end
                 end
-
-
-                if currentZoneId and dead and not wasDead then
-                    wasDead = true
-                    deaths = deaths + 1
-                    killStreak = 0
-                    UpdateHUD()
-                    TriggerServerEvent('lime_redzones:server:reportDeath', currentZoneId)
-
-                    if Opts.killCamEnabled ~= false then
-                        local killer = GetPedSourceOfDeath(ped)
-                        if killer and killer ~= 0 and killer ~= ped and DoesEntityExist(killer) then
-                            CreateThread(function()
-                                killCamActive = true
-                                local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
-
-                                local kPlayer = NetworkGetPlayerIndexFromPed(killer)
-                                if kPlayer == -1 then
-                                    for _, pid in ipairs(GetActivePlayers()) do
-                                        if GetPlayerPed(pid) == killer then kPlayer = pid break end
-                                    end
-                                end
-                                local killerName = (kPlayer and kPlayer ~= -1) and GetPlayerName(kPlayer) or 'Unknown'
-                                local killerId = kPlayer ~= -1 and GetPlayerServerId(kPlayer) or 0
-                                local camDur = math.max(1000, tonumber(Opts.killCamDuration) or 5000)
-
-                                SendNUIMessage({ type = 'killCam', display = true, killer = killerName, id = killerId, duration = camDur })
-
-                                local function frameKiller()
-                                    if not DoesEntityExist(killer) then return end
-                                    -- Third-person: sit behind and above the killer, framing their whole body.
-                                    local kc = GetEntityCoords(killer)
-                                    local heading = GetEntityHeading(killer)
-                                    local rad = math.rad(heading)
-                                    local camPos = vector3(
-                                        kc.x + math.sin(rad) * 2.6,
-                                        kc.y - math.cos(rad) * 2.6,
-                                        kc.z + 1.2
-                                    )
-                                    SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
-                                    PointCamAtEntity(cam, killer, 0.0, 0.0, 0.0, true)
-                                end
-
-                                frameKiller()
-                                SetCamActive(cam, true)
-                                RenderScriptCams(true, false, 0, true, true)
-
-                                local t = GetGameTimer()
-                                while killCamActive and (GetGameTimer() - t) < camDur and DoesEntityExist(killer) do
-                                    Wait(0)
-                                    frameKiller()
-                                end
-
-                                RenderScriptCams(false, false, 0, true, true)
-                                DestroyCam(cam, false)
-                                killCamActive = false
-                                SendNUIMessage({ type = 'killCam', display = false })
-                            end)
-                        end
-                    end
-
-                    local z = Zones[currentZoneId]
-                    local exits = z.exits or {}
-                    local exit
-                    if #exits > 0 then
-                        local e = exits[math.random(#exits)]
-                        exit = { x = e.x, y = e.y, z = e.z }
-                    else
-
-                        local away = (z.teleportAway or 30.0) + z.radius
-                        local ang = math.random() * 6.28318
-                        exit = { x = z.coords.x + math.cos(ang) * away, y = z.coords.y + math.sin(ang) * away, z = z.coords.z }
-                    end
-                    local zid = currentZoneId
-                    -- Fire-and-forget was unreliable: if the request was lost,
-                    -- rate-limited, or the revive silently failed, the player
-                    -- stayed dead with no second attempt. Retry until we're
-                    -- actually alive, then stop.
-                    reviveRequest = { zone = zid, exit = exit, at = GetGameTimer() + (z.reviveDelay or 8000) }
-                elseif not dead and wasDead then
-                    wasDead = false
-                    killCamActive = false
-                    reviveRequest = nil
-                end
             end
 
             -- Per-zone rule: no shooting from outside the zone, so players
-            -- can't camp the perimeter and pick off people inside. Gate it on
-            -- ACTUAL containment (position), not the 30-frame-stale currentZoneId
-            -- — that lag left firing disabled for a moment after leaving, and if
-            -- the loop kept ticking near the edge it never re-enabled. Only
-            -- blocks while genuinely near-but-outside this specific zone.
-            local shootBlocked = false
-            if nearest.blockOutsideShooting == true and not InsideZone(nearest, pos) then
-                shootBlocked = true
-                DisablePlayerFiring(PlayerId(), true)
-                DisableControlAction(0, 24, true)
-                DisableControlAction(0, 25, true)
-                DisableControlAction(0, 140, true)
-                DisableControlAction(0, 141, true)
-                DisableControlAction(0, 142, true)
-                DisableControlAction(0, 257, true)
-            end
-
             -- A safe zone may sit inside/near this redzone — keep it drawn and
             -- its rules enforced while we're handling the redzone.
             local safeVisible2 = safeZone and safeDist <= (safeZone.radius + renderDist) and safeZone.showMarker ~= false
@@ -1698,13 +2263,21 @@ CreateThread(function()
 
             -- Only stay per-frame while something needs it: a visible visual,
             -- an active shooting block, or safe-zone rules. Otherwise ~300ms.
-            if showVisual or shootBlocked or safeVisible2 or currentSafeId then
+            if showVisual or safeVisible2 or currentSafeId then
                 Wait(0)
             else
                 Wait(300)
             end
         end
-        ::continue::
+    end
+
+    while true do
+        local ok, err = pcall(ZonePass)
+        if not ok then
+            print('[lime_redzones] ERROR in zone loop (recovered): ' .. tostring(err))
+            pcall(TriggerServerEvent, 'lime_redzones:server:clientDebug', 'ZONE LOOP ERROR: ' .. tostring(err))
+            Wait(1000)
+        end
     end
 end)
 
@@ -1738,10 +2311,32 @@ local function dbg(...)
     if RZ_DEBUG then print('[lime_redzones]', ...) end
 end
 
+-- Pool readout on demand. Run it before your first death and after each one:
+-- whichever number climbs and never comes back down is the leak. "ours" counts
+-- only entities THIS resource created and still owns, so it separates a leak
+-- here from one in another resource.
+RegisterCommand('rz_pools', function()
+    local mine = 0
+    for _, handles in pairs(spawnedNpcs) do
+        for _, p in ipairs(handles) do
+            if DoesEntityExist(p) then mine = mine + 1 end
+        end
+    end
+    local cams = 0
+    for _ in pairs(liveCams) do cams = cams + 1 end
+    local line = ('%s | ourNpcs=%d ourCams=%d tabletProp=%s')
+        :format(poolCensus(), mine, cams, tostring(tabletProp ~= nil))
+    print('[lime_redzones] ' .. line)
+    Notify(line, 'info', 12000)
+end, false)
+
 RegisterCommand('rz_debug', function()
-    RZ_DEBUG = not RZ_DEBUG
-    Notify('Redzone debug ' .. (RZ_DEBUG and 'ON' or 'OFF') .. '. Check F8 console.', 'info')
-    print('[lime_redzones] debug = ' .. tostring(RZ_DEBUG) .. ' | currentZoneId = ' .. tostring(currentZoneId))
+    -- Per-client override toggle. Flips relative to whatever's currently
+    -- effective (server option or a prior override).
+    RZ_DEBUG_LOCAL = not RZ_DEBUG
+    resolveDebug()
+    Notify('Redzone debug ' .. (RZ_DEBUG and 'ON' or 'OFF') .. ' (local override). Check F8 console.', 'info')
+    print('[lime_redzones] debug = ' .. tostring(RZ_DEBUG) .. ' (override) | server option = ' .. tostring(RZ_DEBUG_SERVER) .. ' | currentZoneId = ' .. tostring(currentZoneId))
 end, false)
 
 AddEventHandler('gameEventTriggered', function(name, args)
@@ -1819,19 +2414,24 @@ AddEventHandler('gameEventTriggered', function(name, args)
 
     if isFatal == 1 or isFatal == true then
         registerKill('isFatal')
-    else
+    elseif not pendingPoll[victim] and not recentKills[victim] then
+        -- ONE poll per victim, not one per bullet. This used to spawn a 1.2s
+        -- polling thread for every non-fatal damage event, so a single burst
+        -- of automatic fire created dozens of concurrent threads and a busy
+        -- zone kept hundreds alive at once — the dedup inside registerKill ran
+        -- far too late to prevent any of it.
+        pendingPoll[victim] = true
         local v = victim
         CreateThread(function()
-            local tries = 0
-            while tries < 15 do
+            for _ = 1, 15 do
                 Wait(80)
-                tries = tries + 1
-                if not DoesEntityExist(v) then return end
+                if not DoesEntityExist(v) then break end
                 if IsEntityDead(v) then
                     registerKill('health-poll')
-                    return
+                    break
                 end
             end
+            pendingPoll[v] = nil
         end)
     end
 end)
