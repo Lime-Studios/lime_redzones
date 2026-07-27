@@ -1,17 +1,6 @@
--- Community Bridge adapter (server).
---
--- If community_bridge is running we route framework/inventory/banking/notify
--- through it, which gets us far wider resource compatibility for free. If it
--- isn't installed we fall back to the bridges shipped with this resource, so
--- the script keeps working standalone.
---
--- Every call is pcall-guarded: Community Bridge's export names have shifted
--- between versions, and a hard error here would break rewards or revives.
-
 CB = { active = false }
 
 CreateThread(function()
-    -- Give it a moment to start if it's ensured after us.
     for _ = 1, 40 do
         if GetResourceState('community_bridge') == 'started' then break end
         Wait(250)
@@ -30,7 +19,6 @@ local function try(fn, ...)
     return res == nil and true or res
 end
 
--- ── Money ───────────────────────────────────────────────────────
 function CB.AddCash(src, amount)
     if not CB.active then return nil end
     return try(function() return exports.community_bridge:AddAccountBalance(src, 'cash', amount) end)
@@ -51,13 +39,11 @@ function CB.RemoveBank(src, amount, reason)
     return try(function() return exports.community_bridge:RemoveAccountBalance(src, 'bank', amount, reason) end)
 end
 
--- ── Inventory ───────────────────────────────────────────────────
 function CB.AddItem(src, item, amount)
     if not CB.active then return nil end
     return try(function() return exports.community_bridge:AddItem(src, item, amount) end)
 end
 
--- ── Identity ────────────────────────────────────────────────────
 function CB.GetPlayerName(src)
     if not CB.active then return nil end
     return try(function() return exports.community_bridge:GetPlayerName(src) end)
@@ -68,9 +54,7 @@ function CB.GetIdentifier(src)
     return try(function() return exports.community_bridge:GetPlayerIdentifier(src) end)
 end
 
--- ── Notify ──────────────────────────────────────────────────────
 function CB.Notify(src, message, ntype)
     if not CB.active then return nil end
     return try(function() return exports.community_bridge:SendNotify(src, message, ntype) end)
 end
-

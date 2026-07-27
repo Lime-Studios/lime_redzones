@@ -1,6 +1,3 @@
-// Edit colours here to restyle the whole UI. Add a theme by adding an
-// entry — it appears everywhere (HUD, kill feed, kill cam, panel) automatically.
-
 export const THEMES = {
   lime:    { accent: '#A3E635', text: '#0a0b0d' },
   crimson: { accent: '#EF4444', text: '#ffffff' },
@@ -8,16 +5,12 @@ export const THEMES = {
   amber:   { accent: '#F59E0B', text: '#1a1205' },
   violet:  { accent: '#A78BFA', text: '#15102b' },
   mono:    { accent: '#E5E7EB', text: '#0a0b0d' },
-  // Admin-defined global theme. Colours are overwritten at runtime by
-  // setCustomTheme() when the server syncs the admin's picks.
   custom:  { accent: '#A3E635', text: '#0a0b0d' },
 }
 
 export const THEME_IDS = Object.keys(THEMES)
-// Ids the admin can pick from the preset row (custom is edited, not listed).
 export const PRESET_THEME_IDS = THEME_IDS.filter(id => id !== 'custom')
 
-// Overwrite the 'custom' theme at runtime (admin theme builder → server sync).
 export function setCustomTheme(accent, text) {
   if (typeof accent === 'string' && /^#[0-9a-fA-F]{6}$/.test(accent)) {
     THEMES.custom.accent = accent
@@ -26,46 +19,57 @@ export function setCustomTheme(accent, text) {
   }
 }
 
-// Accent colour for a theme id (falls back to lime).
-export const accentOf = (id) => (THEMES[id] ?? THEMES.lime).accent
+export const isHex = (v) => typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v)
 
-// Text colour for a theme id (used on the HUD blade).
-export const textOf = (id) => (THEMES[id] ?? THEMES.lime).text
+export const accentOf = (id) => (isHex(id) ? id : (THEMES[id] ?? THEMES.lime).accent)
 
-// Resolve a "match HUD" style: if the value is 'inherit', use the HUD's theme.
+export const textOf = (id) => (isHex(id) ? bestTextOn(id) : (THEMES[id] ?? THEMES.lime).text)
+
+export function hslToHex(h, s, l) {
+  const a = s * Math.min(l, 1 - l)
+  const f = (n) => {
+    const k = (n + h / 30) % 12
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))
+    return Math.round(255 * c).toString(16).padStart(2, '0')
+  }
+  return `#${f(0)}${f(8)}${f(4)}`
+}
+
+export function hexToHue(hex) {
+  const [r, g, b] = hexToRgb(hex).map((c) => c / 255)
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min
+  if (d === 0) return 0
+  let h
+  if (max === r) h = ((g - b) / d) % 6
+  else if (max === g) h = (b - r) / d + 2
+  else h = (r - g) / d + 4
+  return Math.round(((h * 60) + 360) % 360)
+}
+
 export const resolveTheme = (value, hudTheme) => (value === 'inherit' ? hudTheme : value)
 
-// --- helpers for the theme builder -------------------------------------
-
-// Parse #rrggbb → [r,g,b].
 export function hexToRgb(hex) {
   const h = (hex || '').replace('#', '')
   return [parseInt(h.slice(0, 2), 16) || 0, parseInt(h.slice(2, 4), 16) || 0, parseInt(h.slice(4, 6), 16) || 0]
 }
 
-// rgba() string at a given alpha for building soft/border tints.
 export function rgba(hex, a) {
   const [r, g, b] = hexToRgb(hex)
   return `rgba(${r},${g},${b},${a})`
 }
 
-// Lighten a hex toward white by t (0..1) — used for --accent-strong.
 export function lighten(hex, t) {
   const [r, g, b] = hexToRgb(hex)
   const m = (c) => Math.round(c + (255 - c) * t)
   return `#${[m(r), m(g), m(b)].map(c => c.toString(16).padStart(2, '0')).join('')}`
 }
 
-// Pick black or white text for readable contrast on an accent fill.
 export function bestTextOn(hex) {
   const [r, g, b] = hexToRgb(hex)
-  // Relative luminance (sRGB). Bright accents get dark text, dark get white.
   const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
   return lum > 0.6 ? '#0a0b0d' : '#ffffff'
 }
 
-// Full set of :root CSS-var overrides for an accent+text pair. Applying these
-// to document.documentElement recolours the tablet AND every HUD element.
 export function accentVars(accent, text) {
   const t = text || bestTextOn(accent)
   return {

@@ -18,7 +18,6 @@ function InvAddItem(src, item, amount)
         if Inv == 'ox' then
             return exports.ox_inventory:AddItem(src, item, amount)
         elseif Inv == 'one' then
-            -- one_inventory:AddItem(inv, item, count) -> boolean, reason?
             local success = exports.one_inventory:AddItem(src, item, amount)
             return success == true
         elseif Inv == 'qs' then

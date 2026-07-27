@@ -6,12 +6,12 @@ author 'lime'
 description 'lime_redzones — in-game redzone & safe zone creator'
 version '2.1.0'
 
--- Set to 'true' to silence the startup update check.
 suppress_updates 'false'
 
 ui_page 'web/index.html'
 
 files {
+    'locales/*.json',
     'web/index.html',
     'web/bundle.js',
     'web/bundle.css',
@@ -20,7 +20,6 @@ files {
 
 shared_scripts {
     'config.lua',
-    'locales/*.lua',
     'bridge/locale.lua',
 }
 
@@ -29,6 +28,7 @@ client_scripts {
     'bridge/notify.lua',
     'bridge/ambulance.lua',
     'client/client.lua',
+    'client/podium.lua',
 }
 
 dependencies {

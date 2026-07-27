@@ -25,7 +25,7 @@ if not SUPPRESS_UPDATES then
             if c < n then return -1
             elseif c > n then return 1 end
         end
-        return 0 -- equal
+        return 0
     end
 
     function CheckBridgeVersion()

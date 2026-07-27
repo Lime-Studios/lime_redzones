@@ -1,5 +1,3 @@
--- Community Bridge adapter (client).
-
 CB = { active = false }
 
 CreateThread(function()
@@ -9,4 +7,3 @@ CreateThread(function()
     end
     CB.active = GetResourceState('community_bridge') == 'started'
 end)
-

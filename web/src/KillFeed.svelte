@@ -6,12 +6,9 @@
   let el
 
   const accent = $derived(accentOf(theme))
-  // Position is stored as the TOP-RIGHT corner (feed is right-aligned).
   const effPos = $derived(dragPos ?? pos ?? { x: 98, y: 16 })
 
   export function push(entry) {
-    // 'mine' is set by the client (it knows its own server id); keep whatever
-    // it sent.
     const id = Date.now() + Math.random()
     const dur = entry.duration ?? 6000
     feed = [{ id, ...entry }, ...feed].slice(0, 6)

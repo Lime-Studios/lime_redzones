@@ -1,37 +1,40 @@
 <script>
-  import { THEME_IDS, accentOf, bestTextOn, rgba } from './theme.js'
+  import { THEME_IDS, accentOf, bestTextOn, rgba, isHex, hslToHex, hexToHue } from './theme.js'
   import Tutorial from './Tutorial.svelte'
   let { display = false, mode = 'player', tab = 'rzleaderboard',
         zones = {}, gangs = {}, settings = {}, personalColor = null,
         lbData = { players: [], gangs: [], globalPlayers: [], totals: {} },
         placementDraft = null, myIds = null, perms = null, options = {}, logs = [], logCategory = 'admin', logTotal = 0, logConfig = null, prizeHistory = [], firstTime = false, stats = {},
         hudTheme = 'lime', hudPreset = 'top', hudScale = 1, tabletScale = 1, killfeedScale = 1, killfeedTheme = 'inherit', killmsgScale = 1, killmsgTheme = 'inherit', customTheme = null,
+        hudLocked = false, lbEditor = { redzone: [], global: [] },
+        playerGangs = [], gang = null,
+        elo = { rating: null, rank: null, color: null }, eloRanks = [], eloEnabled = true, podiums = [],
         onclose } = $props()
 
   const O = $derived(options ?? {})
   const P = $derived(perms ?? { zones: true, gangs: true, leaderboards: true, options: true, killfeed: true, logs: true })
-  // _full (server console, ACE god, framework god/admin) grants every section —
-  // check it rather than the individual key, so a newly added permission can't
-  // silently hide a tab from someone who should see everything.
   const can = (section) => !!(P._full || P[section])
 
   let activeTab = $state('rzleaderboard')
   let lbTab = $state('players')
   let lbSearch = $state('')
-  let lbSort = $state('rank')  // rank | name | kills-high | kills-low | kd-high
+  let lbSort = $state('rank')
   let editing = $state(null)
   let clock = $state('')
   let selTheme = $state('lime')
   let selPreset = $state('top')
-  // Global theme builder (admin Options tab).
   let customAccent = $state('#A3E635')
   let customText = $state('#0a0b0d')
   let customAuto = $state(true)
   const autoText = $derived(bestTextOn(customAccent))
+  let globalHue = $state(84)
+  let globalHexBad = $state(false)
+  let globalHueInit = $state(false)
+  $effect(() => {
+    if (!globalHueInit && isHex(customAccent)) { globalHue = hexToHue(customAccent); globalHueInit = true }
+  })
+  $effect(() => { if (!display) globalHueInit = false })
 
-  // Keybinds editor. opts.keybinds is the source of truth (saved via saveOptions);
-  // this derived view fills safe defaults so the inputs always have something to
-  // bind to even before the server sync populates it.
   const KB_DEFAULTS = { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } }
   const keybinds = $derived.by(() => {
     const src = opts.keybinds ?? {}
@@ -62,7 +65,6 @@
   let logSearch = $state('')
   let logView = $state('view')
   let refreshSpin = $state(false)
-  // Tablet resize: drag the corner grip, whole UI scales live, persists via KVP.
   let tScale = $state(1)
   let tScaleInit = $state(false)
   $effect(() => { if (display && !tScaleInit) { tScale = Math.min(1.5, Math.max(0.7, +tabletScale || 1)); tScaleInit = true } })
@@ -77,8 +79,6 @@
   }
   function resizeMove(e) {
     if (!resizing) return
-    // Dragging away from centre grows, toward it shrinks. 425 = half the base
-    // width, so a corner-to-corner drag maps ~1:1 onto the scale.
     const d = ((e.clientX - rsStart.x) + (e.clientY - rsStart.y)) / 2
     tScale = Math.min(1.5, Math.max(0.7, rsStart.scale + d / 425))
   }
@@ -86,7 +86,7 @@
     resizing = false
     window.removeEventListener('pointermove', resizeMove)
     post('saveTabletScale', { scale: tScale })
-  }   // 'view' | 'settings' — entries first, config on its own page
+  }
   let logSearchTimer = null
   const logPages = $derived(Math.max(1, Math.ceil(logTotal / logPerPage)))
   function loadLogs(page = logPage) {
@@ -98,10 +98,6 @@
     logSearchTimer = setTimeout(() => loadLogs(1), 300)
   }
   let polyJsonErr = $state(false)
-  // Local editable copy. Binding the textarea straight to a $derived meant
-  // Svelte rewrote the field on every reactive update — a paste was reverted
-  // before onchange could read it. This syncs one-way from the zone, and only
-  // when the user isn't editing.
   let polyJsonText = $state('[]')
   let polyJsonFocused = $state(false)
   $effect(() => {
@@ -153,10 +149,22 @@
     }
     if (!display) tabInit = false
   })
+
+  let lastSaved = null
+  $effect(() => {
+    if (!display || !tabInit) return
+    const t = effectiveTab
+    if (t && t !== lastSaved) {
+      lastSaved = t
+      post('saveLastTab', { tab: t, mode })
+    }
+  })
+  $effect(() => { if (!display) lastSaved = null })
   let styleInit = $state(false)
   $effect(() => {
     if (display && !styleInit) {
-      selTheme = hudTheme; selPreset = hudPreset; hudScaleVal = hudScale || 1; kfScaleVal = killfeedScale || 1; kfThemeVal = killfeedTheme || 'inherit'; kmScaleVal = killmsgScale || 1; kmThemeVal = killmsgTheme || 'inherit';
+      selTheme = hudTheme; selPreset = hudPreset;
+      hudHex = accentOf(hudTheme); hudHue = hexToHue(hudHex); hexDirty = false; hudScaleVal = hudScale || 1; kfScaleVal = killfeedScale || 1; kfThemeVal = killfeedTheme || 'inherit'; kmScaleVal = killmsgScale || 1; kmThemeVal = killmsgTheme || 'inherit';
       if (customTheme && customTheme.accent) {
         customAccent = customTheme.accent
         customText = customTheme.text || bestTextOn(customTheme.accent)
@@ -177,7 +185,6 @@
     if (effectiveTab !== 'resets') confirmWipe = false
     if (!display) hubLoaded = false
   })
-  // Dashboard doesn't push live updates on its own — poll while the tab is open.
   $effect(() => {
     if (display && effectiveTab === 'dash') {
       const iv = setInterval(() => post('requestStats'), 8000)
@@ -192,10 +199,9 @@
   $effect(() => { if (!display) tutDismissed = false })
   const showTutorial = $derived(display && firstTime === true && !tutDismissed && !manualTut)
 
-
   function tutStep(tab) { if (tab) activeTab = tab }
-  function tutClose() { tutDismissed = true; manualTut = false }            // skip/finish — reappears next fresh login
-  function tutDisable() { tutDismissed = true; manualTut = false; post('tutorialSeen') }  // don't show again — persisted
+  function tutClose() { tutDismissed = true; manualTut = false }
+  function tutDisable() { tutDismissed = true; manualTut = false; post('tutorialSeen') }
   $effect(() => {
     if (placementDraft && display) { editing = placementDraft; activeTab = 'zones' }
   })
@@ -213,17 +219,123 @@
     fetch(`https://lime_redzones/${cb}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
       .then(r => r.json()).catch(() => ({}))
 
-  // Push the admin's custom accent to the server, which stores it and syncs it
-  // to every connected player. text:null tells clients to auto-pick contrast.
   function saveCustomTheme() {
     post('saveCustomTheme', { accent: customAccent, text: customAuto ? null : customText })
   }
 
+  const HD_DEFAULTS = {
+    theme: 'lime', preset: 'top', scale: 1, pos: false, szPos: false,
+    kfTheme: 'inherit', kfScale: 1, kfPos: false,
+    kmTheme: 'inherit', kmScale: 1, kmPos: false, lock: false,
+  }
+  let hd = $state({ ...HD_DEFAULTS })
+  let hdKey = $state(null)
+  let hdPending = {}
+  let hdTimer = null
+  let hdHue = $state(84)
+  let hdHexBad = $state(false)
+  $effect(() => {
+    const src = settings?.options?.hudDefaults
+    if (!src || src === hdKey) return
+    hdKey = src
+    hd = { ...HD_DEFAULTS, ...src }
+    if (isHex(hd.theme)) hdHue = hexToHue(hd.theme)
+  })
+  function setHd(patch, live = false) {
+    hd = { ...hd, ...patch }
+    hdPending = { ...hdPending, ...patch }
+    clearTimeout(hdTimer)
+    hdTimer = setTimeout(() => {
+      const p = hdPending
+      hdPending = {}
+      post('saveHudDefaults', { ...p, silent: live })
+    }, live ? 350 : 0)
+  }
+  const hdAccent = $derived(accentOf(hd.theme))
+  const posLabel = (p, fallback = 'default spot') => (p && typeof p.x === 'number' ? `${Math.round(p.x)}% / ${Math.round(p.y)}%` : fallback)
+
+  const G = $derived(gang ?? {})
+  const myGang = $derived(G.gang ?? null)
+  const myGangRank = $derived(G.rank ?? null)
+  const canInvite = $derived(myGangRank === 'owner' || myGangRank === 'officer')
+  const isGangOwner = $derived(myGangRank === 'owner')
+  const RANK_LABEL = { owner: 'Owner', officer: 'Officer', member: 'Member' }
+
+  let gangLoaded = $state(false)
+  $effect(() => {
+    if (display && effectiveTab === 'gang' && !gangLoaded) { gangLoaded = true; post('gangState') }
+    if (!display || effectiveTab !== 'gang') gangLoaded = false
+  })
+  let newGang = $state({ label: '', tag: '', color: '#A3E635' })
+  let gangEditOpen = $state(false)
+  let gangDraft = $state({ label: '', tag: '', color: '#A3E635' })
+  let inviteId = $state('')
+  let inviteSearch = $state('')
+  $effect(() => { if (!display) { gangEditOpen = false; inviteSearch = ''; inviteId = '' } })
+  const rosterRows = $derived.by(() => {
+    const q = inviteSearch.trim().toLowerCase()
+    const list = G.roster ?? []
+    return (q ? list.filter(r => String(r.name ?? '').toLowerCase().includes(q) || String(r.id) === q) : list).slice(0, 60)
+  })
+  function openGangEdit() {
+    gangDraft = { label: myGang?.label ?? '', tag: myGang?.tag ?? '', color: myGang?.color ?? '#A3E635' }
+    gangEditOpen = true
+  }
+  function createGang() {
+    if (newGang.label.trim().length < 3 || newGang.tag.trim().length < 2) return
+    post('gangCreate', { label: newGang.label.trim(), tag: newGang.tag.trim(), color: newGang.color })
+    newGang = { label: '', tag: '', color: '#A3E635' }
+  }
+
+  let lbeBoard = $state('redzone')
+  let lbeSearch = $state('')
+  let lbeDraft = $state({})
+  let lbeLoaded = $state(false)
+  $effect(() => {
+    if (display && effectiveTab === 'resets' && !lbeLoaded) { lbeLoaded = true; post('requestLbEditor') }
+    if (!display || effectiveTab !== 'resets') lbeLoaded = false
+  })
+  $effect(() => { if (!display) { lbeDraft = {}; lbeSearch = '' } })
+  const lbeRows = $derived.by(() => {
+    const list = lbEditor?.[lbeBoard] ?? []
+    const q = lbeSearch.trim().toLowerCase()
+    const filtered = q
+      ? list.filter(r => String(r.name ?? '').toLowerCase().includes(q) || String(r.id ?? '').toLowerCase().includes(q))
+      : list
+    return filtered.slice(0, 200)
+  })
+  const lbeVal = (r, k) => {
+    const d = lbeDraft[r.id]
+    if (d && d[k] !== undefined) return d[k]
+    return r[k] ?? (k === 'elo' ? '' : 0)
+  }
+  function lbeSet(r, k, v) {
+    lbeDraft = { ...lbeDraft, [r.id]: { ...(lbeDraft[r.id] ?? {}), [k]: v } }
+  }
+  const lbeDirty = (r) => !!lbeDraft[r.id]
+  function lbeSave(r) {
+    const raw = lbeVal(r, 'elo')
+    post('saveLbEntry', {
+      board: lbeBoard, id: r.id,
+      kills: Math.max(0, Math.floor(+lbeVal(r, 'kills') || 0)),
+      deaths: Math.max(0, Math.floor(+lbeVal(r, 'deaths') || 0)),
+      elo: (raw === '' || raw === null || raw === undefined) ? false : Math.max(0, Math.floor(+raw || 0)),
+    })
+    const d = { ...lbeDraft }
+    delete d[r.id]
+    lbeDraft = d
+  }
+  function lbeRevert(r) {
+    const d = { ...lbeDraft }
+    delete d[r.id]
+    lbeDraft = d
+  }
+
   const zoneList = $derived(Object.values(zones ?? {}))
   let bulkMode = $state(false)
-  let bulkSel = $state(new Set())          // selected zone ids
-  let bulkType = $state(null)              // locked to first selected zone's type
-  let bulkPatch = $state({})               // only fields the admin touched
+  let bulkSel = $state(new Set())
+  let bulkType = $state(null)
+  let bulkPatch = $state({})
   function bulkToggleSel(z) {
     const next = new Set(bulkSel)
     if (next.has(z.id)) { next.delete(z.id) }
@@ -235,22 +347,30 @@
     if (next.size === 0) { bulkType = null }
   }
   function bulkSelectableType(z) {
-    // Once a type is chosen, rows of the other type are locked out.
     return bulkType === null || (z.type === 'safezone' ? 'safezone' : 'redzone') === bulkType
   }
   function bulkExit() { bulkMode = false; bulkSel = new Set(); bulkType = null; bulkPatch = {} }
   function bulkSetField(k, v) { bulkPatch = { ...bulkPatch, [k]: v } }
   function bulkUnset(k) { const p = { ...bulkPatch }; delete p[k]; bulkPatch = p }
+  const BULK_PAIRED = new Set(['teleportCostSource', 'killHealFull'])
+  const bulkChangeCount = $derived(Object.keys(bulkPatch).filter(k => !BULK_PAIRED.has(k)).length)
   function bulkApply() {
     if (bulkSel.size === 0 || Object.keys(bulkPatch).length === 0) return
     post('bulkUpdateZones', { ids: [...bulkSel], patch: bulkPatch })
     bulkExit()
   }
-  let tpFilter = $state('all')  // 'all' | 'redzone' | 'safezone'
+  let tpFilter = $state('all')
   const tpZones = $derived(Object.values(zones ?? {})
     .filter(z => z.enabled !== false && z.allowTeleport === true)
     .filter(z => tpFilter === 'all' || (tpFilter === 'safezone' ? z.type === 'safezone' : z.type !== 'safezone')))
-  const gangList = $derived(Object.entries(gangs ?? {}).map(([name, g]) => ({ name, label: g.label })))
+  const gangList = $derived(Object.entries(gangs ?? {}).map(([name, g]) => {
+    const st = (lbData.gangs ?? []).find(x => x.label === g.label) ?? {}
+    return {
+      name, label: g.label,
+      kills: st.kills ?? 0,
+      deaths: st.deaths ?? 0,
+    }
+  }).sort((a, b) => b.kills - a.kills || a.label.localeCompare(b.label)))
   const adminList = $derived(settings?.admins ?? [])
   const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
 
@@ -265,7 +385,6 @@
   const myKey = $derived(myIds ? (myIds.identifier || myIds.license) : null)
   const isMe = (item) => myKey && (item.id === myKey || item.id === myIds?.license || item.id === myIds?.identifier)
 
-  // Tag each with its true rank before filtering/sorting.
   const lbRanked = $derived((lbRaw ?? []).map((it, idx) => ({ ...it, _rank: idx + 1 })))
 
   const lbList = $derived.by(() => {
@@ -277,7 +396,6 @@
     else if (lbSort === 'kills-high') arr.sort((a, b) => (b.kills ?? 0) - (a.kills ?? 0))
     else if (lbSort === 'kills-low')  arr.sort((a, b) => (a.kills ?? 0) - (b.kills ?? 0))
     else if (lbSort === 'kd-high')    arr.sort((a, b) => ((b.kills??0)/Math.max(1,b.deaths??0)) - ((a.kills??0)/Math.max(1,a.deaths??0)))
-    // 'rank' keeps original order
     return arr
   })
 
@@ -294,6 +412,7 @@
   const lbGrid = $derived('44px 1fr' + (lbCols?.kills ? ' 75px' : '') + (lbCols?.deaths ? ' 75px' : '') + (lbCols?.kd ? ' 65px' : ''))
 
   const initial = (n) => (n ?? '?')[0].toUpperCase()
+  const num = (n) => (Number(n) || 0).toLocaleString('en-US')
   const kd = (k, d) => (d > 0 ? (k / d) : k).toFixed(2)
 
   let hue = $state(0), sat = $state(100), val = $state(100), opacity = $state(80)
@@ -331,22 +450,24 @@
 
   let newGangName = $state(''), newGangLabel = $state('')
   let newAdminId = $state(''), newAdminRank = $state('')
-  let rs = $state({ enabled: false, day: 0, hour: 18, prizeName: 'money', prizeAmount: 0 })
-  let grs = $state({ enabled: false, day: 0, hour: 18, prizeName: 'money', prizeAmount: 0 })
+  let rs = $state({ enabled: false, day: 0, hour: 18, prizeName: 'money', prizeAmount: 0, resetElo: false })
+  let grs = $state({ enabled: false, day: 0, hour: 18, prizeName: 'money', prizeAmount: 0, resetElo: false })
   let ranks = $state([])
   let opts = $state({
     rewardNotify: true, streakAnnounce: true, renderDistance: 120,
+    gangMode: 'framework', gangMaxMembers: 10, gangCreateCost: 0, gangCreateCostSource: 'cash', gangInviteExpiry: 120,
     leaderboardEnabled: true, globalLbEnabled: true, gangLbEnabled: true,
     streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
-    killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
-    tabletAnim: true,
+    killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000,
+    tabletAnim: true, tabletProp: 'prop_cs_tablet',
+    tabletAnimDict: 'amb@code_human_in_bus_passenger_idles@female@tablet@base', tabletAnimName: 'base',
+    reviveWaitMedical: 12000, reviveWaitNative: 4000, nativeReviveFallback: true, logColor: 10672181,
     keybinds: { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } },
     lbCols: { kills: true, deaths: true, kd: true },
   })
   let settingsKey = $state(null)
   $effect(() => {
     if (!settings) return
-    // Only re-sync on a fresh server push, never on local edits (would self-trigger).
     if (settings === settingsKey) return
     settingsKey = settings
     if (settings.reset) rs = { ...settings.reset }
@@ -354,9 +475,10 @@
     if (settings.options) {
       const def = {
         rewardNotify: true, streakAnnounce: true, renderDistance: 120,
+        gangMode: 'framework', gangMaxMembers: 10, gangCreateCost: 0, gangCreateCostSource: 'cash', gangInviteExpiry: 120,
         leaderboardEnabled: true, globalLbEnabled: true, gangLbEnabled: true,
         streaksEnabled: true, personalColorEnabled: true, personalColorHue: true, personalColorOpacity: true,
-        killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000, hudDefaultTheme: 'lime', hudDefaultPreset: 'top',
+        killFeedEnabled: true, killCamEnabled: true, killMessageEnabled: true, killFeedDuration: 6000, killCamDuration: 5000,
         tabletAnim: true,
         keybinds: { leaderboard: { enabled: true, key: 'F1' }, admin: { enabled: false, key: 'F6' }, hudMove: { enabled: false, key: 'F7' } },
         lbCols: { kills: true, deaths: true, kd: true },
@@ -401,7 +523,7 @@
   }) : ({
     id: null, type: 'redzone', name: '', coords: { x: 0, y: 0, z: 0 }, radius: 60,
     colorHex: '#FF0000', colorA: 80, blipSprite: 310, blipColor: 1,
-    rewardItems: [{ name: 'money', amount: 500 }], streakRewards: [],
+    rewardItems: [{ name: 'money', amount: 500 }], streakRewards: [], killHeal: 0, killHealFull: false,
     reviveCost: 10000, reviveInside: true, reviveDelay: 8000, reviveCostSource: 'cash', teleportAway: 30, exits: [], enabled: true,
     deleteVehicleOnEntry: true, infiniteStamina: false, showBlip: true, showRadiusBlip: true, showMarker: true, hideHud: false,
     allowTeleport: false, teleportCost: 0, teleportCostSource: 'cash', tpPoints: [],
@@ -411,10 +533,9 @@
   function startEdit(z, type) {
     editing = JSON.parse(JSON.stringify(z ?? blankZone(type)))
     editing.type ??= 'redzone'
-    // Redzone-only arrays — the editor binds to them, so they must exist,
-    // but a safe zone has no use for them.
     if (editing.type !== 'safezone') {
       editing.rewardItems ??= []; editing.streakRewards ??= []; editing.exits ??= []; editing.tpPoints ??= []
+      editing.killHeal ??= 0; editing.killHealFull ??= false
     }
     editing.poly ??= []
     editing.tpPoints ??= []
@@ -443,30 +564,147 @@
   const THEME_LIST = THEME_IDS.map(id => ({ id, c: accentOf(id) }))
   const PRESET_LIST = ['top', 'top-left', 'top-right', 'bottom', 'left', 'right']
 
+  const ladder = $derived([...(eloRanks ?? [])].sort((a, b) => (a.min ?? 0) - (b.min ?? 0)))
+
+  const tierFor = (rating) => {
+    if (rating == null || !ladder.length) return null
+    let t = null
+    for (const r of ladder) if (rating >= (r.min ?? 0)) t = r
+    return t
+  }
+  const rankedList = $derived(
+    (lbData.players ?? [])
+      .filter(p => p.elo != null)
+      .map(p => ({ ...p, tier: tierFor(p.elo) }))
+      .sort((a, b) => (b.elo ?? 0) - (a.elo ?? 0))
+  )
+
+  const myTierIdx = $derived.by(() => {
+    const r = elo?.rating
+    if (r == null || !ladder.length) return -1
+    let idx = 0
+    for (let i = 0; i < ladder.length; i++) if (r >= (ladder[i].min ?? 0)) idx = i
+    return idx
+  })
+  const nextTier = $derived(myTierIdx >= 0 ? ladder[myTierIdx + 1] ?? null : null)
+  const tierPct = $derived.by(() => {
+    if (myTierIdx < 0) return 0
+    const cur = ladder[myTierIdx]?.min ?? 0
+    if (!nextTier) return 100
+    const span = (nextTier.min ?? 0) - cur
+    if (span <= 0) return 100
+    return Math.max(0, Math.min(100, (((elo?.rating ?? 0) - cur) / span) * 100))
+  })
+
+  let eBodyEl = $state(null)
+  let secList = $state([])
+  $effect(() => {
+    const _ = editing && editing.type
+    if (!editing || !eBodyEl) { secList = []; return }
+    queueMicrotask(() => {
+      if (!eBodyEl) return
+      secList = [...eBodyEl.querySelectorAll('.e-sec')].map((el, i) => {
+        el.id = `esec-${i}`
+        return { id: `esec-${i}`, label: el.textContent.trim() }
+      })
+    })
+  })
+  const jumpTo = (id) => document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
+  const ELO_DEFAULTS = {
+    enabled: true, start: 1000, floor: 0,
+    kNew: 48, kMid: 32, kHigh: 20,
+    provisional: 30, highAt: 5000,
+    streakFrom: 3, streakStep: 3, streakCap: 30, kdBoostMax: 0.25,
+  }
+
+  function sortTiers() {
+    if (ranksDraft) ranksDraft.sort((a, b) => (+a.min || 0) - (+b.min || 0))
+  }
+  function moveTier(i, dir) {
+    const j = i + dir
+    if (!ranksDraft || j < 0 || j >= ranksDraft.length) return
+    const a = ranksDraft[i], b = ranksDraft[j]
+    const tmp = a.min
+    a.min = b.min
+    b.min = tmp
+    sortTiers()
+  }
+  function insertTierAfter(i) {
+    if (!ranksDraft) return
+    const cur = +ranksDraft[i].min || 0
+    const next = ranksDraft[i + 1] ? (+ranksDraft[i + 1].min || 0) : cur + 1000
+    const mid = Math.round((cur + next) / 2)
+    ranksDraft.splice(i + 1, 0, { min: mid === cur ? cur + 1 : mid, name: 'New tier', color: '#ffffff' })
+    sortTiers()
+  }
+
+  let eloDraft = $state(null)
+  let ranksDraft = $state(null)
+  let newPodium = $state({ label: '', board: 'redzone' })
+  const S = $derived(settings ?? {})
+  $effect(() => {
+    if (!display || effectiveTab !== 'ranked') return
+    if (!eloDraft && S.elo) eloDraft = { ...ELO_DEFAULTS, ...S.elo }
+    if (!ranksDraft && S.eloRanks) {
+      ranksDraft = S.eloRanks.map(r => ({ ...r }))
+      sortTiers()
+    }
+  })
+  $effect(() => { if (!display) { eloDraft = null; ranksDraft = null } })
+  let podiumsLoaded = $state(false)
+  $effect(() => {
+    if (display && effectiveTab === 'ranked' && !podiumsLoaded) {
+      podiumsLoaded = true
+      post('requestPodiumAdmin')
+    }
+    if (!display) podiumsLoaded = false
+  })
+
+  let hudHex = $state('#A3E635')
+  let hudHue = $state(84)
+  let hexDirty = $state(false)
+  const hudAccent = $derived(accentOf(selTheme))
+  let hudColourTimer = null
+  function applyHudColour(hex, live = false) {
+    if (!isHex(hex)) return
+    hudHex = hex
+    hudHue = hexToHue(hex)
+    selTheme = hex
+    clearTimeout(hudColourTimer)
+    hudColourTimer = setTimeout(() => {
+      post('saveHudTheme', { theme: hex, preset: selPreset, scale: hudScaleVal, silent: live })
+    }, live ? 250 : 0)
+  }
+
   const playerNavAll = [
     { id: 'hub',           label: 'Hub',            icon: 'M3 12l9-9 9 9M5 10v10h14V10' },
     { id: 'teleport',      label: 'Teleport',        icon: 'M12 2l3 7h7l-5.5 4.5L18 21l-6-4-6 4 1.5-7.5L2 9h7z' },
     { id: 'rzleaderboard', label: 'RZ Leaderboard', icon: 'M8 21h8M12 17v4M7 4h10v6a5 5 0 0 1-10 0V4z', need: 'leaderboardEnabled' },
     { id: 'leaderboard',   label: 'Leaderboard',    icon: 'M3 13h4v8H3zM10 5h4v16h-4zM17 9h4v12h-4z', need: 'globalLbEnabled' },
+    { id: 'rank',          label: 'Rank',           icon: 'M8 21h8M12 17v4M6 4h12v5a6 6 0 0 1-12 0zM6 6H3v2a4 4 0 0 0 3 3.9M18 6h3v2a4 4 0 0 1-3 3.9' },
+    { id: 'gang',          label: 'Gang',           icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75', gangs: true },
     { id: 'color',         label: 'Zone Colour',    icon: 'M12 2a10 10 0 1 0 10 10c0-1-1-2-2-2h-2a2 2 0 0 1-2-2c0-1 1-2 2-2h1a2 2 0 0 0 2-2c0-1-4-2-9-2z', need: 'personalColorEnabled' },
     { id: 'hud',           label: 'HUD',            icon: 'M3 5h18v12H3zM8 21h8' },
   ]
   const adminNavAll = [
-    { id: 'dash',     label: 'Dashboard',    icon: 'M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z' },
-    { id: 'zones',    label: 'Zones',        icon: 'M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z', perm: 'zones' },
-    { id: 'gangs',    label: 'Gangs',        icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', perm: 'gangs' },
-    { id: 'resets',   label: 'Leaderboards', icon: 'M3 12a9 9 0 1 0 9-9M3 12l3-3M3 12l3 3', perm: 'leaderboards' },
-    { id: 'killfeed', label: 'Feed & Cam',   icon: 'M2 6h20v12H2zM8 10l4 2-4 2z', perm: 'killfeed' },
-    { id: 'options',  label: 'Options',      icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', perm: 'options' },
-    { id: 'perms',    label: 'Permissions',  icon: 'M12 2l7 4v5c0 5-3.5 9-7 11-3.5-2-7-6-7-11V6l7-4z', perm: 'options' },
-    { id: 'logs',     label: 'Logs',         icon: 'M4 4h16v16H4zM8 9h8M8 13h8M8 17h5', perm: 'logs' },
+    { id: 'dash',     label: 'Dashboard',    group: '',        icon: 'M3 3h8v8H3zM13 3h8v5h-8zM13 10h8v11h-8zM3 13h8v8H3z' },
+    { id: 'zones',    label: 'Zones',        group: 'Manage',  icon: 'M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z', perm: 'zones' },
+    { id: 'gangs',    label: 'Gangs',        group: 'Manage',  icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z', perm: 'gangs' },
+    { id: 'resets',   label: 'Leaderboards', group: 'Manage',  icon: 'M3 12a9 9 0 1 0 9-9M3 12l3-3M3 12l3 3', perm: 'leaderboards' },
+    { id: 'ranked',   label: 'Ranked',       group: 'Manage',  icon: 'M8 21h8M12 17v4M6 4h12v5a6 6 0 0 1-12 0zM6 6H3v2a4 4 0 0 0 3 3.9M18 6h3v2a4 4 0 0 1-3 3.9', perm: 'leaderboards' },
+    { id: 'options',  label: 'Options',      group: 'Configure', icon: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z', perm: 'options' },
+    { id: 'killfeed', label: 'Feed & Cam',   group: 'Configure', icon: 'M2 6h20v12H2zM8 10l4 2-4 2z', perm: 'killfeed' },
+    { id: 'perms',    label: 'Permissions',  group: 'Configure', icon: 'M12 2l7 4v5c0 5-3.5 9-7 11-3.5-2-7-6-7-11V6l7-4z', perm: 'options' },
+    { id: 'logs',     label: 'Logs',         group: 'Configure', icon: 'M4 4h16v16H4zM8 9h8M8 13h8M8 17h5', perm: 'logs' },
   ]
   const nav = $derived(
     mode === 'admin'
       ? adminNavAll.filter(n => !n.perm || can(n.perm))
-      : playerNavAll.filter(n => !n.need || O[n.need] !== false)
+      : playerNavAll
+          .filter(n => !n.need || O[n.need] !== false)
+          .filter(n => !n.gangs || ((O.gangMode ?? 'framework') === 'player' && O.gangLbEnabled !== false))
   )
-  // $derived (not $effect) so an invalid tab can't cause an update loop.
   const effectiveTab = $derived(
     nav.find(n => n.id === activeTab) ? activeTab : (nav[0]?.id ?? activeTab)
   )
@@ -505,11 +743,14 @@
     </span>
   </div>
 
-  <Tutorial open={showTutorial || manualTut} mode={mode} onstep={tutStep} onclose={tutClose} ondisable={tutDisable} />
+  <Tutorial open={showTutorial || manualTut} mode={mode} tabs={nav.map(n => n.id)} onstep={tutStep} onclose={tutClose} ondisable={tutDisable} />
 
   <div class="tbody">
     <div class="nav">
-      {#each nav as n}
+      {#each nav as n, i}
+        {#if n.group && n.group !== nav[i - 1]?.group}
+          <span class="nav-group">{n.group}</span>
+        {/if}
         <button class="nav-item" class:on={effectiveTab === n.id} onclick={() => activeTab = n.id}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d={n.icon} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span>{n.label}</span>
@@ -534,6 +775,13 @@
             <span class="hub-big">{myStanding ? '#' + myStanding._rank : '—'}</span>
             <span class="hub-sub">{myStanding ? 'Redzone leaderboard' : 'No kills yet — get in a zone!'}</span>
           </div>
+          {#if elo?.rating != null}
+          <div class="hub-card big elo-card" style:--tier={elo.color || 'var(--accent)'}>
+            <span class="hub-label">Redzone Elo</span>
+            <span class="hub-big elo-num">{num(elo.rating)}</span>
+            <span class="hub-tier">{elo.rank ?? ''}</span>
+          </div>
+          {/if}
           <div class="hub-card">
             <span class="hub-label">Kills</span>
             <span class="hub-num">{myStanding?.kills ?? 0}</span>
@@ -623,6 +871,7 @@
         <div class="seg">
           <button class:on={lbTab === 'players'} onclick={() => lbTab = 'players'}>Players</button>
           {#if gangLbOn}<button class:on={lbTab === 'gangs'} onclick={() => lbTab = 'gangs'}>Gangs</button>{/if}
+          {#if eloEnabled}<button class:on={lbTab === 'ranked'} onclick={() => lbTab = 'ranked'}>Ranked</button>{/if}
         </div>
         {/if}
         {#if resetInfo?.enabled}
@@ -644,6 +893,24 @@
           </select>
         </div>
 
+        {#if lbTab === 'ranked'}
+        <div class="lb">
+          <div class="lb-head rank-grid">
+            <span>#</span><span>PLAYER</span><span>TIER</span><span class="c">ELO</span>
+          </div>
+          {#if rankedList.length === 0}
+            <div class="empty">Nobody has been rated yet.</div>
+          {/if}
+          {#each rankedList.filter(p => !lbSearch.trim() || String(p.name ?? '').toLowerCase().includes(lbSearch.trim().toLowerCase())) as p, i (p.id ?? i)}
+            <div class="lb-row rank-grid" class:me={isMe(p)}>
+              <span class="rank" class:r1={i===0} class:r2={i===1} class:r3={i===2}>{i + 1}</span>
+              <span class="who"><span class="av">{initial(p.name)}</span>{p.name ?? 'Unknown'}{#if isMe(p)}<span class="you-tag">YOU</span>{/if}</span>
+              <span>{#if p.tier}<span class="tier-prev" style:--tier={p.tier.color}>{p.tier.name}</span>{/if}</span>
+              <span class="c bold">{num(p.elo)}</span>
+            </div>
+          {/each}
+        </div>
+        {:else}
         <div class="lb">
           <div class="lb-head" style:grid-template-columns={lbGrid}>
             <span>#</span><span>{lbTab === 'gangs' ? 'GANG' : 'PLAYER'}</span>
@@ -664,6 +931,7 @@
             </div>
           {/each}
         </div>
+        {/if}
 
         <div class="block" style="margin-top:4px">
           <div class="frow between">
@@ -683,6 +951,50 @@
             {/each}
           {/if}
         </div>
+
+      {:else if effectiveTab === 'rank'}
+        <div class="page-head"><h1>Rank</h1></div>
+        {#if !eloEnabled}
+          <p class="sub">Ranked play is turned off on this server.</p>
+        {:else if elo?.rating == null}
+          <p class="sub">Get a kill in a redzone to be placed.</p>
+        {:else}
+          <p class="sub">Your Elo goes up when you win fights and down when you lose them. Who you beat matters more than how many you beat.</p>
+
+          <div class="rank-hero" style:--tier={elo.color || 'var(--accent)'}>
+            <span class="rank-tier">{elo.rank ?? ''}</span>
+            <span class="rank-elo">{num(elo.rating)}</span>
+            {#if nextTier}
+              <div class="rank-bar"><span style:width={tierPct + '%'}></span></div>
+              <span class="rank-next">
+                {num(Math.max(0, (nextTier.min ?? 0) - elo.rating))} to <b style:color={nextTier.color}>{nextTier.name}</b>
+              </span>
+            {:else}
+              <span class="rank-next">Top tier reached.</span>
+            {/if}
+          </div>
+
+          <div class="block">
+            <b class="blk-title">How it works</b>
+            <div class="how-row"><span class="how-ic up">+</span><span><b>Get a kill</b> — you take Elo from the player you killed.</span></div>
+            <div class="how-row"><span class="how-ic down">−</span><span><b>Die</b> — they take Elo from you.</span></div>
+            <div class="how-row"><span class="how-ic up">↑</span><span><b>Beat someone ranked higher</b> — you gain more. Beat someone far below you and you gain very little.</span></div>
+            <div class="how-row"><span class="how-ic up">★</span><span><b>Kill streaks</b> — extra Elo on top, from your third kill in a row.</span></div>
+            <div class="how-row"><span class="how-ic">≡</span><span><b>New players move fastest</b> — your first fights shift your Elo more, so you reach your real rank quickly.</span></div>
+          </div>
+
+          <div class="block">
+            <b class="blk-title">Ladder</b>
+            {#each ladder as t, i}
+              <div class="ladder-row" class:on={i === myTierIdx}>
+                <span class="ladder-dot" style:background={t.color}></span>
+                <span class="ladder-name">{t.name}</span>
+                <span class="ladder-min">{num(t.min ?? 0)}+</span>
+                {#if i === myTierIdx}<span class="pill">You</span>{/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
 
       {:else if effectiveTab === 'color'}
         <div class="page-head"><h1>Zone Colour</h1></div>
@@ -704,11 +1016,159 @@
           </div>
         </div>
 
+      {:else if effectiveTab === 'gang'}
+        <div class="page-head"><h1>Gang</h1></div>
+
+        {#if !myGang}
+          <p class="sub">Start a crew or accept an invite. Every redzone kill your members get counts towards your gang on the leaderboard.</p>
+
+          {#if (G.invites ?? []).length}
+            <div class="block">
+              <b class="blk-title">Invitations</b>
+              {#each G.invites as inv (inv.id)}
+                <div class="frow inset">
+                  <span class="gang-tag" style:--gc={inv.color || 'var(--accent)'}>{inv.tag}</span>
+                  <span class="grow">
+                    <b class="gl">{inv.label}</b>
+                    <p class="hint">Invited by {inv.by} · {inv.members} member{inv.members === 1 ? '' : 's'}</p>
+                  </span>
+                  <button class="btn" onclick={() => post('gangInviteAnswer', { id: inv.id, accept: false })}>Decline</button>
+                  <button class="btn go" onclick={() => post('gangInviteAnswer', { id: inv.id, accept: true })}>Join</button>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          <div class="block">
+            <b class="blk-title">Start a gang</b>
+            <div class="frow">
+              <label class="f grow"><span>Name</span><input bind:value={newGang.label} maxlength="24" placeholder="Grove Street" /></label>
+              <label class="f w90"><span>Tag</span><input bind:value={newGang.tag} maxlength="4" placeholder="GSF" spellcheck="false" /></label>
+              <label class="f w70"><span>Colour</span><input type="color" bind:value={newGang.color} /></label>
+            </div>
+            {#if G.createCost > 0}
+              <p class="hint">Costs <b>${num(G.createCost)}</b> from your {G.createCostSource === 'bank' ? 'bank' : 'cash'}.</p>
+            {/if}
+            <p class="hint">Up to {G.maxMembers ?? 10} members. 3+ characters for the name, 2-4 for the tag.</p>
+            <button class="btn go end"
+              disabled={newGang.label.trim().length < 3 || newGang.tag.trim().length < 2}
+              onclick={createGang}>Create gang</button>
+          </div>
+        {:else}
+          <div class="gang-hero" style:--gc={myGang.color || 'var(--accent)'}>
+            <span class="gang-tag big">{myGang.tag}</span>
+            <span class="gang-hero-meta">
+              <b>{myGang.label}</b>
+              <span class="hint">{myGang.members.length}/{myGang.max} members · you are {RANK_LABEL[myGangRank] ?? 'a member'}</span>
+            </span>
+            <span class="gang-hero-stats">
+              <span><em>{num(myGang.kills)}</em>Kills</span>
+              <span><em>{num(myGang.deaths)}</em>Deaths</span>
+              <span><em>{kd(myGang.kills, myGang.deaths)}</em>K/D</span>
+            </span>
+          </div>
+
+          {#if canInvite}
+            <div class="block">
+              <b class="blk-title">Invite players</b>
+              {#if myGang.members.length >= myGang.max}
+                <p class="hint">Your gang is full.</p>
+              {:else}
+                <div class="frow">
+                  <label class="f grow"><span>Search online players</span><input bind:value={inviteSearch} spellcheck="false" placeholder="Name…" /></label>
+                  <label class="f w90"><span>Server ID</span><input bind:value={inviteId} spellcheck="false" placeholder="12" /></label>
+                  <button class="btn go end" onclick={() => { if (inviteId.trim()) { post('gangInvite', { target: +inviteId.trim() }); inviteId = '' } }}>Invite</button>
+                </div>
+                {#if rosterRows.length === 0}
+                  <p class="hint">{(G.roster ?? []).length === 0 ? 'Nobody online is gang-free right now.' : 'No match.'}</p>
+                {:else}
+                  <div class="roster">
+                    {#each rosterRows as r (r.id)}
+                      <button class="roster-row" onclick={() => post('gangInvite', { target: r.id })}>
+                        <span class="av">{initial(r.name)}</span>
+                        <span class="grow">{r.name}</span>
+                        <span class="dim">#{r.id}</span>
+                        <span class="roster-add">Invite</span>
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              {/if}
+            </div>
+          {/if}
+
+          <div class="block">
+            <b class="blk-title">Members</b>
+            {#each myGang.members as m (m.id)}
+              <div class="frow inset">
+                <span class="av" class:off={!m.online}>{initial(m.name)}</span>
+                <span class="grow">
+                  <b class="gl">{m.name}</b>
+                  <p class="hint">{RANK_LABEL[m.rank] ?? 'Member'}{m.online ? ' · online' : ''}</p>
+                </span>
+                {#if isGangOwner && m.id !== G.me}
+                  {#if m.rank === 'member'}
+                    <button class="btn" onclick={() => post('gangSetRank', { id: m.id, rank: 'officer' })}>Promote</button>
+                  {:else if m.rank === 'officer'}
+                    <button class="btn" onclick={() => post('gangSetRank', { id: m.id, rank: 'member' })}>Demote</button>
+                  {/if}
+                  <button class="btn" class:confirming={pendingConfirm === 'gowner:' + m.id}
+                    onclick={() => confirmedClick('gowner:' + m.id, () => post('gangSetRank', { id: m.id, rank: 'owner' }))}>
+                    {pendingConfirm === 'gowner:' + m.id ? 'Confirm hand over' : 'Make owner'}
+                  </button>
+                {/if}
+                {#if canInvite && m.id !== G.me && m.rank !== 'owner' && !(myGangRank === 'officer' && m.rank === 'officer')}
+                  <button class="ib red" class:confirming={pendingConfirm === 'gkick:' + m.id}
+                    title={pendingConfirm === 'gkick:' + m.id ? 'Click to confirm' : 'Remove'}
+                    onclick={() => confirmedClick('gkick:' + m.id, () => post('gangKick', { id: m.id }))}>
+                    {pendingConfirm === 'gkick:' + m.id ? '✓' : '✕'}
+                  </button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+
+          {#if isGangOwner}
+            <div class="block">
+              <div class="frow between">
+                <b class="blk-title" style="margin:0">Gang settings</b>
+                <button class="btn" onclick={() => gangEditOpen ? (gangEditOpen = false) : openGangEdit()}>{gangEditOpen ? 'Cancel' : 'Edit'}</button>
+              </div>
+              {#if gangEditOpen}
+                <div class="frow">
+                  <label class="f grow"><span>Name</span><input bind:value={gangDraft.label} maxlength="24" /></label>
+                  <label class="f w90"><span>Tag</span><input bind:value={gangDraft.tag} maxlength="4" spellcheck="false" /></label>
+                  <label class="f w70"><span>Colour</span><input type="color" bind:value={gangDraft.color} /></label>
+                </div>
+                <button class="btn go end" onclick={() => { post('gangEdit', gangDraft); gangEditOpen = false }}>Save</button>
+              {/if}
+              <button class="btn red" class:confirming={pendingConfirm === 'gdisband'}
+                onclick={() => confirmedClick('gdisband', () => post('gangDisband'))}>
+                {pendingConfirm === 'gdisband' ? 'Click to confirm — this deletes the gang' : 'Disband gang'}
+              </button>
+            </div>
+          {:else}
+            <div class="block">
+              <button class="btn red" class:confirming={pendingConfirm === 'gleave'}
+                onclick={() => confirmedClick('gleave', () => post('gangLeave'))}>
+                {pendingConfirm === 'gleave' ? 'Click to confirm' : 'Leave gang'}
+              </button>
+            </div>
+          {/if}
+        {/if}
+
       {:else if effectiveTab === 'hud'}
         <div class="page-head"><h1>HUD</h1></div>
 
+        {#if hudLocked}
         <div class="block">
-          <b class="blk-title">Theme</b>
+          <b class="blk-title">HUD locked</b>
+          <p class="hint">An admin has set a server-wide HUD style. Colours, positions and sizes are fixed while the lock is on — anything you saved before is kept and comes back if the lock is lifted.</p>
+        </div>
+        {:else}
+
+        <div class="block">
+          <b class="blk-title">Colour</b>
           <div class="themes">
             {#each THEME_LIST as t}
               <button class="theme-chip" class:on={selTheme === t.id} onclick={() => { selTheme = t.id; post('saveHudTheme', { theme: t.id, preset: selPreset, scale: hudScaleVal }) }}>
@@ -716,12 +1176,31 @@
               </button>
             {/each}
           </div>
+
+          <label class="f"><span>Hue <em style:color={hudAccent}>{hudHue}°</em></span>
+            <input class="track hue" type="range" min="0" max="360" step="1" value={hudHue}
+              oninput={(e) => { hudHue = +e.target.value; hudHex = hslToHex(hudHue, 0.72, 0.55); selTheme = hudHex; applyHudColour(hudHex, true) }}
+              onchange={() => applyHudColour(hudHex)} />
+          </label>
+
+          <label class="f"><span>Hex code</span>
+            <span class="hexrow">
+              <span class="hex-swatch" style:background={isHex(hudHex) ? hudHex : 'transparent'}></span>
+              <input class="hex-in" spellcheck="false" maxlength="7" placeholder="#A3E635"
+                value={hudHex}
+                oninput={(e) => { hudHex = e.target.value.trim(); hexDirty = !isHex(hudHex) }}
+                onchange={() => { if (isHex(hudHex)) { hexDirty = false; applyHudColour(hudHex) } else { hexDirty = true } }} />
+              <input class="hex-native" type="color" value={isHex(hudHex) ? hudHex : '#A3E635'}
+                oninput={(e) => applyHudColour(e.target.value, true)} aria-label="Pick colour" />
+            </span>
+          </label>
+          {#if hexDirty}<p class="hint bad">Needs to be a 6-digit hex like #A3E635.</p>{/if}
         </div>
 
         <div class="block">
           <b class="blk-title">HUD Preview</b>
           <div class="hud-stage">
-            <div class="hud-mini" style:--mini-accent={THEME_LIST.find(t=>t.id===selTheme)?.c ?? '#A3E635'} style:transform={`translateX(-50%) scale(${hudScaleVal})`}>
+            <div class="hud-mini" style:--mini-accent={hudAccent} style:transform={`translateX(-50%) scale(${hudScaleVal})`}>
               <span class="hm-blade">REDZONE</span>
               <span class="hm-stats">3 / 1 / 2</span>
             </div>
@@ -743,6 +1222,15 @@
             <button class="btn" onclick={() => post('resetHudPos')}>Reset to preset</button>
           </div>
           <p class="hint">Drag mode closes the tablet — move the HUD, then click Done.</p>
+        </div>
+
+        <div class="block">
+          <b class="blk-title">Safe Zone Badge</b>
+          <p class="hint">The badge shown while you're inside a green zone. It has its own position, since both can be on screen at once.</p>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('startSzMove')}><svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M12 2v20M2 12h20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Move badge</button>
+            <button class="btn" onclick={() => post('resetSzPos')}>Reset</button>
+          </div>
         </div>
 
         {#if O.killFeedEnabled !== false}
@@ -783,6 +1271,7 @@
           </div>
           <p class="hint">A preview appears — drag it where you want, then click Done.</p>
         </div>
+        {/if}
         {/if}
       {/if}
 
@@ -927,28 +1416,124 @@
                     <div class="seg"><button class:on={(bulkPatch.teleportCostSource ?? 'cash') !== 'bank'} onclick={() => bulkSetField('teleportCostSource','cash')}>Cash</button><button class:on={bulkPatch.teleportCostSource === 'bank'} onclick={() => bulkSetField('teleportCostSource','bank')}>Bank</button></div>
                   {/if}
                 </div>
+
+                <div class="bulk-row" class:active={'killHeal' in bulkPatch}>
+                  <button class="bulk-inc" class:on={'killHeal' in bulkPatch} onclick={() => ('killHeal' in bulkPatch) ? (bulkUnset('killHeal'), bulkUnset('killHealFull')) : (bulkSetField('killHeal', 25), bulkSetField('killHealFull', false))} aria-label="Include">
+                    {#if 'killHeal' in bulkPatch}<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>{/if}
+                  </button>
+                  <span class="bulk-label">Heal on kill</span>
+                  {#if 'killHeal' in bulkPatch}
+                    <input class="bulk-num" type="number" min="0" max="200" step="5" value={bulkPatch.killHeal}
+                      disabled={bulkPatch.killHealFull === true}
+                      oninput={(e) => bulkSetField('killHeal', +e.target.value)} />
+                    <div class="seg">
+                      <button class:on={bulkPatch.killHealFull !== true} onclick={() => bulkSetField('killHealFull', false)}>Amount</button>
+                      <button class:on={bulkPatch.killHealFull === true} onclick={() => bulkSetField('killHealFull', true)}>Full</button>
+                    </div>
+                  {/if}
+                </div>
               {/if}
 
               <button class="btn go end" disabled={Object.keys(bulkPatch).length === 0} onclick={bulkApply}>
-                Apply to {bulkSel.size} zone{bulkSel.size === 1 ? '' : 's'}{Object.keys(bulkPatch).length > 0 ? ' · ' + Object.keys(bulkPatch).filter(k => k !== 'teleportCostSource').length + ' change' + (Object.keys(bulkPatch).filter(k => k !== 'teleportCostSource').length === 1 ? '' : 's') : ''}
+                Apply to {bulkSel.size} zone{bulkSel.size === 1 ? '' : 's'}{bulkChangeCount > 0 ? ' · ' + bulkChangeCount + ' change' + (bulkChangeCount === 1 ? '' : 's') : ''}
               </button>
             {/if}
           </div>
         {/if}
 
       {:else if effectiveTab === 'gangs'}
-        <div class="page-head"><h1>Gangs</h1></div>
+        <div class="page-head">
+          <h1>Gangs</h1>
+          <div class="stat-pills"><span class="pill">Registered <b>{gangList.length}</b></span></div>
+        </div>
         <div class="block">
+          <b class="blk-title">Where gangs come from</b>
+          <div class="seg">
+            <button class:on={(opts.gangMode ?? 'framework') === 'framework'} onclick={() => opts.gangMode = 'framework'}>Framework</button>
+            <button class:on={opts.gangMode === 'player'} onclick={() => opts.gangMode = 'player'}>Player-made</button>
+            <button class:on={opts.gangMode === 'off'} onclick={() => opts.gangMode = 'off'}>Off</button>
+          </div>
+          <p class="hint">
+            {#if (opts.gangMode ?? 'framework') === 'framework'}
+              Gang membership is read from QBX / QB-Core / ESX. Nothing for players to do.
+            {:else if opts.gangMode === 'player'}
+              Players get a Gang tab where they can start a crew, invite others and climb the gang leaderboard. Framework gangs are ignored.
+            {:else}
+              Nothing is credited to gangs and the gang leaderboard stays empty.
+            {/if}
+          </p>
+          {#if opts.gangMode === 'player'}
+            <div class="grid2">
+              <label class="f"><span>Max members</span><input type="number" min="2" max="60" bind:value={opts.gangMaxMembers} /></label>
+              <label class="f"><span>Invite expires <em>seconds</em></span><input type="number" min="15" max="3600" step="15" bind:value={opts.gangInviteExpiry} /></label>
+            </div>
+            <div class="grid2">
+              <label class="f"><span>Cost to start a gang</span><input type="number" min="0" step="500" bind:value={opts.gangCreateCost} /></label>
+              <label class="f"><span>Taken from</span>
+                <select bind:value={opts.gangCreateCostSource}><option value="cash">Cash</option><option value="bank">Bank</option></select>
+              </label>
+            </div>
+          {/if}
+          <button class="btn go end" onclick={() => post('saveOptions', opts)}>Save</button>
+        </div>
+
+        {#if opts.gangMode === 'player'}
+        <div class="block">
+          <div class="frow between">
+            <b class="blk-title" style="margin:0">Player Gangs <span class="dim">({(playerGangs ?? []).length})</span></b>
+            <button class="btn" onclick={() => post('requestAdminData')}>Refresh</button>
+          </div>
+          {#if (playerGangs ?? []).length === 0}
+            <p class="hint">Nobody has started a gang yet.</p>
+          {:else}
+            {#each playerGangs as g (g.id)}
+              <div class="frow inset">
+                <span class="gang-tag" style:--gc={g.color || 'var(--accent)'}>{g.tag}</span>
+                <span class="grow">
+                  <b class="gl">{g.label}</b>
+                  <p class="hint">{g.owner} · {g.members} member{g.members === 1 ? '' : 's'} ({g.online} online) · {num(g.kills)}K / {num(g.deaths)}D</p>
+                </span>
+                <button class="ib red" class:confirming={pendingConfirm === 'pg:' + g.id}
+                  title={pendingConfirm === 'pg:' + g.id ? 'Click to confirm' : 'Disband'}
+                  onclick={() => confirmedClick('pg:' + g.id, () => post('adminDeleteGang', { id: g.id }))}>
+                  {pendingConfirm === 'pg:' + g.id ? '✓' : '✕'}
+                </button>
+              </div>
+            {/each}
+          {/if}
+        </div>
+        {/if}
+
+        <div class="block">
+          <b class="blk-title">Display names</b>
           <div class="frow">
             <label class="f grow"><span>Internal name</span><input bind:value={newGangName} placeholder="ballas" /></label>
             <label class="f grow"><span>Display label</span><input bind:value={newGangLabel} placeholder="Ballas" /></label>
             <button class="btn go end" onclick={saveGang}>Add</button>
           </div>
-          <p class="hint">Framework gangs auto-detect — this is for standalone servers.</p>
+          <p class="hint">Framework gangs are detected automatically and don't need adding here — this is for standalone servers, or to give a framework gang a nicer display name.</p>
         </div>
-        {#each gangList as g (g.name)}
-          <div class="block row"><b class="gl">{g.label}</b><span class="dim grow">{g.name}</span><button class="ib red" class:confirming={pendingConfirm === 'gang:'+g.name} title={pendingConfirm === 'gang:'+g.name ? 'Click to confirm' : 'Delete'} onclick={() => confirmedClick('gang:'+g.name, () => post('deleteGang', { name: g.name }))}>{#if pendingConfirm === 'gang:'+g.name}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>{/if}</button></div>
-        {/each}
+
+        {#if gangList.length === 0}
+          <div class="block empty">
+            <b>No gangs registered</b>
+            <p class="hint">On a framework server gangs are picked up automatically as players earn kills. Add one above only if you're running standalone.</p>
+          </div>
+        {:else}
+          <div class="gang-head"><span>Gang</span><span>Kills</span><span>Deaths</span><span>K/D</span><span></span></div>
+          {#each gangList as g (g.name)}
+            <div class="block gang-row">
+              <span class="gang-id">
+                <b class="gl">{g.label}</b>
+                <span class="dim">{g.name}</span>
+              </span>
+              <span class="gnum">{g.kills}</span>
+              <span class="gnum dim">{g.deaths}</span>
+              <span class="gnum">{kd(g.kills, g.deaths)}</span>
+              <button class="ib red" class:confirming={pendingConfirm === 'gang:'+g.name} title={pendingConfirm === 'gang:'+g.name ? 'Click to confirm' : 'Delete'} onclick={() => confirmedClick('gang:'+g.name, () => post('deleteGang', { name: g.name }))}>{#if pendingConfirm === 'gang:'+g.name}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>{/if}</button>
+            </div>
+          {/each}
+        {/if}
 
       {:else if effectiveTab === 'resets'}
         <div class="page-head"><h1>Leaderboards</h1></div>
@@ -961,13 +1546,17 @@
               <label class="f grow"><span>Prize item</span><input bind:value={s.cfg.prizeName} placeholder="money (or bank)" /></label>
               <label class="f w90"><span>Amount</span><input type="number" min="0" bind:value={s.cfg.prizeAmount} /></label>
             </div>
+            <div class="frow between">
+              <div><b>Also clear Elo</b><p class="hint">Off by default — ratings survive the weekly wipe. Turn on for a full seasonal reset.</p></div>
+              <button class="sw" class:on={s.cfg.resetElo === true} onclick={() => s.cfg.resetElo = !s.cfg.resetElo} aria-label="Toggle"><i></i></button>
+            </div>
             <div class="frow">
               <button class="btn go" onclick={() => post('saveResetSettings', { which: s.which, cfg: s.cfg })}>Save</button>
               <button class="btn red" class:confirming={pendingConfirm === 'reset:'+s.which} onclick={() => confirmedClick('reset:'+s.which, () => post('resetLeaderboard', { which: s.which === 'globalReset' ? 'global' : 'zone' }))}>{pendingConfirm === 'reset:'+s.which ? 'Click to confirm reset' : 'Reset Now'}</button>
             </div>
           </div>
         {/each}
-        <p class="hint">Prize goes to #1 by kills. Offline winners receive it on next join.</p>
+        <p class="hint">Prize goes to #1 by kills. Offline winners receive it on next join. Kills and deaths are zeroed; Elo ratings and podium appearances are kept unless you turn on "Also clear Elo".</p>
 
         <div class="block">
           <div class="frow between">
@@ -997,6 +1586,203 @@
             {#if confirmWipe}<button class="btn" onclick={() => confirmWipe = false}>Cancel</button>{/if}
           {/if}
         </div>
+
+        <div class="block">
+          <div class="frow between">
+            <b class="blk-title">Score Editor</b>
+            <button class="btn" onclick={() => post('requestLbEditor')}>Refresh</button>
+          </div>
+          <p class="hint">Correct a player's kills, deaths or Elo directly. Changes apply to everyone immediately.</p>
+          <div class="seg">
+            <button class:on={lbeBoard === 'redzone'} onclick={() => { lbeBoard = 'redzone'; lbeDraft = {} }}>Redzone</button>
+            <button class:on={lbeBoard === 'global'} onclick={() => { lbeBoard = 'global'; lbeDraft = {} }}>Global</button>
+          </div>
+          <input bind:value={lbeSearch} placeholder="Search name or identifier…" spellcheck="false" />
+
+          {#if lbeRows.length === 0}
+            <p class="hint">{lbeSearch.trim() ? 'Nobody matches that search.' : 'No recorded players on this board yet.'}</p>
+          {:else}
+            <div class="lbe-head">
+              <span>Player</span><span>Kills</span><span>Deaths</span><span>Elo</span><span></span>
+            </div>
+            <div class="lbe-list">
+              {#each lbeRows as r (r.id)}
+                <div class="lbe-row" class:dirty={lbeDirty(r)}>
+                  <span class="lbe-name" title={r.id}>{r.name || 'Unknown'}<em>{r.id}</em></span>
+                  <input class="lbe-num" type="number" min="0" step="1" value={lbeVal(r, 'kills')}
+                    oninput={(e) => lbeSet(r, 'kills', e.target.value)} />
+                  <input class="lbe-num" type="number" min="0" step="1" value={lbeVal(r, 'deaths')}
+                    oninput={(e) => lbeSet(r, 'deaths', e.target.value)} />
+                  <input class="lbe-num" type="number" min="0" step="1" placeholder="—" value={lbeVal(r, 'elo')}
+                    oninput={(e) => lbeSet(r, 'elo', e.target.value)} />
+                  <span class="lbe-acts">
+                    {#if lbeDirty(r)}
+                      <button class="ib" title="Discard changes" onclick={() => lbeRevert(r)}>↺</button>
+                      <button class="ib ok" title="Save" onclick={() => lbeSave(r)}>✓</button>
+                    {:else}
+                      <button class="ib red" class:confirming={pendingConfirm === 'lbe:' + r.id}
+                        title={pendingConfirm === 'lbe:' + r.id ? 'Click to confirm' : 'Remove from board'}
+                        onclick={() => confirmedClick('lbe:' + r.id, () => post('deleteLbEntry', { board: lbeBoard, id: r.id }))}>
+                        {pendingConfirm === 'lbe:' + r.id ? '✓' : '✕'}
+                      </button>
+                    {/if}
+                  </span>
+                </div>
+              {/each}
+            </div>
+            <p class="hint">Leave Elo blank to clear a rating — that player starts again from the configured starting rating.</p>
+          {/if}
+        </div>
+
+      {:else if effectiveTab === 'ranked'}
+        <div class="page-head"><h1>Ranked</h1></div>
+        <p class="sub">Redzone Elo and the podiums that display it. Rating is exchanged between the two players on every kill, so beating someone above you pays and farming someone below you does not.</p>
+
+        {#if eloDraft}
+        <div class="block">
+          <div class="frow between blk-toggle">
+            <div>
+              <b class="blk-title" style="margin:0">Elo</b>
+              <p class="hint">Turn off to freeze every rating where it is. Nothing is lost.</p>
+            </div>
+            <button class="sw" class:on={eloDraft.enabled} onclick={() => eloDraft.enabled = !eloDraft.enabled} aria-label="Toggle Elo"><i></i></button>
+          </div>
+
+          <div class="sub-sec">Where players start</div>
+          <div class="grid2">
+            <label class="f"><span>Starting rating</span>
+              <input type="number" min="0" max="5000" step="50" bind:value={eloDraft.start} />
+              <em class="fh">Everyone begins here.</em>
+            </label>
+            <label class="f"><span>Rating floor</span>
+              <input type="number" min="0" max="5000" step="50" bind:value={eloDraft.floor} />
+              <em class="fh">Losses can never take a player below this.</em>
+            </label>
+          </div>
+
+          <div class="sub-sec">How far one fight moves a rating</div>
+          <p class="hint">Bigger number, bigger swing per fight. New players get a bigger one so they reach their real rank in a few nights rather than a few weeks.</p>
+          <div class="grid3">
+            <label class="f"><span>New players</span><input type="number" min="1" max="200" bind:value={eloDraft.kNew} /></label>
+            <label class="f"><span>Established</span><input type="number" min="1" max="200" bind:value={eloDraft.kMid} /></label>
+            <label class="f"><span>Top players</span><input type="number" min="1" max="200" bind:value={eloDraft.kHigh} /></label>
+          </div>
+          <div class="grid2">
+            <label class="f"><span>Stop counting as new after</span>
+              <input type="number" min="0" max="1000" bind:value={eloDraft.provisional} />
+              <em class="fh">Kills and deaths added together.</em>
+            </label>
+            <label class="f"><span>Count as a top player from</span>
+              <input type="number" min="0" max="10000" step="100" bind:value={eloDraft.highAt} />
+              <em class="fh">Based on rating, not leaderboard position.</em>
+            </label>
+          </div>
+
+          <div class="sub-sec">Kill streak bonus</div>
+          <div class="grid3">
+            <label class="f"><span>Starts at kill</span><input type="number" min="1" max="100" bind:value={eloDraft.streakFrom} /></label>
+            <label class="f"><span>Each kill after</span><input type="number" min="0" max="100" bind:value={eloDraft.streakStep} /></label>
+            <label class="f"><span>Never more than</span><input type="number" min="0" max="500" bind:value={eloDraft.streakCap} /></label>
+          </div>
+          <p class="hint example">
+            A <b>5-kill streak</b> would pay
+            <b>+{Math.max(0, Math.min((5 - (+eloDraft.streakFrom || 3) + 1) * (+eloDraft.streakStep || 0), +eloDraft.streakCap || 0))}</b>
+            on top of the normal gain.
+          </p>
+
+          <div class="sub-sec">K/D boost</div>
+          <p class="hint">Players with a strong K/D climb to their true rating faster. This only speeds them up — it never hands out free rating, because a good K/D is already what a high rating means.</p>
+          <label class="f"><span>Maximum speed-up <em>{Math.round((eloDraft.kdBoostMax ?? 0) * 100)}%</em></span>
+            <input class="track" type="range" min="0" max="1" step="0.05" bind:value={eloDraft.kdBoostMax} />
+          </label>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('saveEloSettings', eloDraft)}>Save Elo settings</button>
+            <button class="btn danger" class:confirming={pendingConfirm === 'wipeElo'}
+              onclick={() => confirmedClick('wipeElo', () => post('wipeElo'))}>
+              {pendingConfirm === 'wipeElo' ? 'Click again to confirm' : 'Reset all ratings'}
+            </button>
+          </div>
+          <p class="hint">Resetting clears every player's rating so the server starts from the base value again. Kills and deaths are untouched.</p>
+        </div>
+        {/if}
+
+        {#if ranksDraft}
+        <div class="block">
+          <b class="blk-title">Rank tiers</b>
+          <p class="hint">A player shows the highest tier their rating reaches. Rows are re-sorted by rating when you save.</p>
+
+          <div class="tier-head">
+            <span></span><span></span><span>Tier</span><span>From rating</span><span></span>
+          </div>
+          {#each ranksDraft as r, i (i)}
+            <div class="tier-row" class:dup={ranksDraft.filter(x => +x.min === +r.min).length > 1}>
+              <span class="tier-move">
+                <button onclick={() => moveTier(i, -1)} disabled={i === 0} title="Move down the ladder" aria-label="Move down">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <button onclick={() => moveTier(i, 1)} disabled={i === ranksDraft.length - 1} title="Move up the ladder" aria-label="Move up">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M18 15l-6-6-6 6" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </span>
+              <input class="tier-color" type="color" bind:value={r.color} aria-label="Tier colour" />
+              <input class="tier-name" style:--tier={r.color || '#fff'} bind:value={r.name} placeholder="Tier name" maxlength="20" />
+              <input class="tier-min" type="number" min="0" max="100000" step="50" bind:value={r.min} onchange={sortTiers} />
+              <span class="tier-acts">
+                <button class="tier-ins" onclick={() => insertTierAfter(i)} title="Insert a tier above this one" aria-label="Insert tier">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+                </button>
+                <button class="tier-del" onclick={() => ranksDraft.splice(i, 1)} title="Remove tier" aria-label="Remove tier">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
+                </button>
+              </span>
+            </div>
+          {/each}
+          <p class="hint">Arrows swap a tier with its neighbour, so you can reorder without retyping any ratings. <b>+</b> adds a tier halfway to the next one.</p>
+          {#if ranksDraft.some((x, i) => ranksDraft.findIndex(y => +y.min === +x.min) !== i)}
+            <p class="hint bad">Two tiers share the same rating — the lower one will never be reachable.</p>
+          {/if}
+
+          <div class="hud-actions">
+            <button class="btn" onclick={() => {
+              const top = ranksDraft.reduce((m, x) => Math.max(m, +x.min || 0), 0)
+              ranksDraft.push({ min: top + 500, name: 'New tier', color: '#ffffff' })
+            }}>Add tier</button>
+            <button class="btn" onclick={() => ranksDraft = (S.eloRanks ?? []).map(r => ({ ...r }))}>Revert</button>
+            <button class="btn go" onclick={() => post('saveEloRanks', { ranks: ranksDraft })}>Save tiers</button>
+          </div>
+        </div>
+        {/if}
+
+        {#if can('zones')}
+        <div class="block">
+          <b class="blk-title">Podiums</b>
+          <p class="hint">Physical 1st/2nd/3rd peds showing a board's top three. Placing walks you through the three spots in order — E places, X undoes, G saves. Winners' outfits are captured from their own character, so podium peds look right even when they're offline.</p>
+          {#if podiums.length}
+            {#each podiums as p (p.id)}
+              <div class="pod-row">
+                <span class="pod-id">
+                  <b>{p.label}</b>
+                  <span class="dim">{p.board === 'global' ? 'Global board' : p.board === 'ranked' ? 'Ranked by Elo' : 'Redzone board'} · {p.count}/3 placed</span>
+                </span>
+                <button class="btn sm" onclick={() => post('startPodiumPlacement', { id: p.id, label: p.label, board: p.board })}>Reposition</button>
+                <button class="btn danger sm" onclick={() => { post('deletePodium', { id: p.id }); post('requestPodiumAdmin') }}>Delete</button>
+              </div>
+            {/each}
+          {:else}
+            <p class="hint">No podiums yet.</p>
+          {/if}
+
+          <div class="pod-new">
+            <input bind:value={newPodium.label} placeholder="New podium name" maxlength="40" />
+            <select bind:value={newPodium.board}>
+              <option value="redzone">Redzone board</option>
+              <option value="global">Global board</option>
+              <option value="ranked">Ranked (by Elo)</option>
+            </select>
+            <button class="btn go" onclick={() => post('startPodiumPlacement', { id: '', label: newPodium.label || 'Podium', board: newPodium.board })}>Place</button>
+          </div>
+        </div>
+        {/if}
 
       {:else if effectiveTab === 'killfeed'}
         <div class="page-head"><h1>Kill Feed &amp; Cam</h1></div>
@@ -1070,6 +1856,29 @@
           {/each}
         </div>
         <div class="block">
+          <b class="blk-title">Revive Timing</b>
+          <p class="hint">How long to wait for a revive to land before giving up. The longer value applies when an ambulance job is installed — some hold you down for a countdown before letting you up.</p>
+          <div class="grid2">
+            <label class="f"><span>With ambulance job <em>ms</em></span>
+              <input type="number" min="2000" max="60000" step="500" bind:value={opts.reviveWaitMedical} /></label>
+            <label class="f"><span>Without one <em>ms</em></span>
+              <input type="number" min="1000" max="30000" step="500" bind:value={opts.reviveWaitNative} /></label>
+          </div>
+          <div class="frow between">
+            <div><b>Native fallback revive</b><p class="hint">Only used when no death system is detected at all. A detected ambulance job always wins over this.</p></div>
+            <button class="sw" class:on={opts.nativeReviveFallback} onclick={() => opts.nativeReviveFallback = !opts.nativeReviveFallback} aria-label="Toggle"><i></i></button>
+          </div>
+        </div>
+
+        <div class="block">
+          <b class="blk-title">Tablet Pose</b>
+          <p class="hint">Stock GTA prop and animation dictionary. Upper-body idle, so players can still walk with the tablet out.</p>
+          <label class="f"><span>Prop model</span><input spellcheck="false" bind:value={opts.tabletProp} placeholder="prop_cs_tablet" /></label>
+          <label class="f"><span>Animation dictionary</span><input spellcheck="false" bind:value={opts.tabletAnimDict} /></label>
+          <label class="f"><span>Animation name</span><input spellcheck="false" bind:value={opts.tabletAnimName} placeholder="base" /></label>
+        </div>
+
+        <div class="block">
           <b class="blk-title">Personal Colour Controls</b>
           <div class="frow between"><div><b>Hue / colour picker</b></div><button class="sw" class:on={opts.personalColorHue} onclick={() => opts.personalColorHue = !opts.personalColorHue} aria-label="Toggle"><i></i></button></div>
           <div class="frow between"><div><b>Opacity slider</b></div><button class="sw" class:on={opts.personalColorOpacity} onclick={() => opts.personalColorOpacity = !opts.personalColorOpacity} aria-label="Toggle"><i></i></button></div>
@@ -1082,9 +1891,101 @@
         </div>
         <div class="block">
           <b class="blk-title">HUD Defaults (server-wide)</b>
-          <label class="f"><span>Default theme</span><select bind:value={opts.hudDefaultTheme}>{#each THEME_LIST as t}<option value={t.id}>{t.id}</option>{/each}</select></label>
-          <label class="f"><span>Default position preset</span><select bind:value={opts.hudDefaultPreset}>{#each PRESET_LIST as pr}<option value={pr}>{pr}</option>{/each}</select></label>
-          <p class="hint">Players who haven't customised use these defaults.</p>
+          <p class="hint">What every player sees before they customise anything. Saved instantly — no need to press Save Options.</p>
+
+          <div class="frow between">
+            <div><b>Lock HUD styling</b><p class="hint">Force these defaults on everyone and hide the player HUD controls. Personal settings are kept, just not applied.</p></div>
+            <button class="sw" class:on={hd.lock} onclick={() => setHd({ lock: !hd.lock })} aria-label="Toggle HUD lock"><i></i></button>
+          </div>
+
+          <div class="sub-sec">Redzone HUD</div>
+          <div class="themes">
+            {#each THEME_LIST as t}
+              <button class="theme-chip" class:on={hd.theme === t.id} onclick={() => setHd({ theme: t.id })}>
+                <span class="theme-dot" style:background={t.c}></span>{t.id}
+              </button>
+            {/each}
+          </div>
+          <label class="f"><span>Hue <em style:color={hdAccent}>{hdHue}°</em></span>
+            <input class="track hue" type="range" min="0" max="360" step="1" value={hdHue}
+              oninput={(e) => { hdHue = +e.target.value; hdHexBad = false; setHd({ theme: hslToHex(hdHue, 0.72, 0.55) }, true) }} />
+          </label>
+          <label class="f"><span>Accent hex</span>
+            <span class="hexrow">
+              <span class="hex-swatch" style:background={hdAccent}></span>
+              <input class="hex-in" spellcheck="false" maxlength="7" placeholder="#A3E635" value={isHex(hd.theme) ? hd.theme : hdAccent}
+                oninput={(e) => {
+                  const v = e.target.value.trim()
+                  if (isHex(v)) { hdHue = hexToHue(v); hdHexBad = false; setHd({ theme: v }, true) }
+                  else hdHexBad = true
+                }} />
+              <input class="hex-native" type="color" value={hdAccent}
+                oninput={(e) => { hdHue = hexToHue(e.target.value); setHd({ theme: e.target.value }, true) }} aria-label="Pick default HUD colour" />
+            </span>
+          </label>
+          {#if hdHexBad}<p class="hint bad">Needs to be a 6-digit hex like #A3E635.</p>{/if}
+
+          <label class="f"><span>Position preset</span>
+            <select value={hd.preset} onchange={(e) => setHd({ preset: e.target.value })}>
+              {#each PRESET_LIST as pr}<option value={pr}>{pr}</option>{/each}
+            </select>
+          </label>
+          <label class="f"><span>Scale <em>{Math.round((hd.scale ?? 1) * 100)}%</em></span>
+            <input class="track" type="range" min="0.6" max="1.6" step="0.05" value={hd.scale ?? 1}
+              oninput={(e) => setHd({ scale: +e.target.value }, true)} />
+          </label>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('startHudMove', { asDefault: true })}>Place default HUD</button>
+            <button class="btn" onclick={() => setHd({ pos: false })}>Use preset</button>
+            <span class="pos-tag">{posLabel(hd.pos, 'preset')}</span>
+          </div>
+
+          <div class="sub-sec">Safe zone badge</div>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('startSzMove', { asDefault: true })}>Place default badge</button>
+            <button class="btn" onclick={() => setHd({ szPos: false })}>Clear</button>
+            <span class="pos-tag">{posLabel(hd.szPos)}</span>
+          </div>
+
+          <div class="sub-sec">Kill feed</div>
+          <label class="f"><span>Theme</span>
+            <select value={hd.kfTheme} onchange={(e) => setHd({ kfTheme: e.target.value })}>
+              <option value="inherit">Match HUD</option>
+              {#each THEME_LIST as t}<option value={t.id}>{t.id}</option>{/each}
+            </select>
+          </label>
+          <label class="f"><span>Scale <em>{Math.round((hd.kfScale ?? 1) * 100)}%</em></span>
+            <input class="track" type="range" min="0.6" max="1.6" step="0.05" value={hd.kfScale ?? 1}
+              oninput={(e) => setHd({ kfScale: +e.target.value }, true)} />
+          </label>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('startKfMove', { asDefault: true })}>Place default feed</button>
+            <button class="btn" onclick={() => setHd({ kfPos: false })}>Clear</button>
+            <span class="pos-tag">{posLabel(hd.kfPos)}</span>
+          </div>
+
+          <div class="sub-sec">"Eliminated" message</div>
+          <label class="f"><span>Theme</span>
+            <select value={hd.kmTheme} onchange={(e) => setHd({ kmTheme: e.target.value })}>
+              <option value="inherit">Match HUD</option>
+              {#each THEME_LIST as t}<option value={t.id}>{t.id}</option>{/each}
+            </select>
+          </label>
+          <label class="f"><span>Scale <em>{Math.round((hd.kmScale ?? 1) * 100)}%</em></span>
+            <input class="track" type="range" min="0.6" max="1.6" step="0.05" value={hd.kmScale ?? 1}
+              oninput={(e) => setHd({ kmScale: +e.target.value }, true)} />
+          </label>
+          <div class="hud-actions">
+            <button class="btn go" onclick={() => post('startKmMove', { asDefault: true })}>Place default message</button>
+            <button class="btn" onclick={() => setHd({ kmPos: false })}>Clear</button>
+            <span class="pos-tag">{posLabel(hd.kmPos)}</span>
+          </div>
+
+          <p class="hint">"Place" closes the tablet so you can drag the element where you want it — click Done and that becomes the server default.</p>
+          <button class="btn red" class:confirming={pendingConfirm === 'hudDefaults'}
+            onclick={() => confirmedClick('hudDefaults', () => post('saveHudDefaults', { reset: true }))}>
+            {pendingConfirm === 'hudDefaults' ? 'Click to confirm' : 'Reset HUD defaults'}
+          </button>
         </div>
         <div class="block">
           <b class="blk-title">Global Theme Builder</b>
@@ -1101,6 +2002,24 @@
               <code>{customAuto ? 'auto' : customText}</code>
             </label>
           </div>
+
+          <label class="f"><span>Hue <em style:color={customAccent}>{globalHue}°</em></span>
+            <input class="track hue" type="range" min="0" max="360" step="1" value={globalHue}
+              oninput={(e) => { globalHue = +e.target.value; customAccent = hslToHex(globalHue, 0.72, 0.55); globalHexBad = false }} />
+          </label>
+          <label class="f"><span>Accent hex</span>
+            <span class="hexrow">
+              <span class="hex-swatch" style:background={isHex(customAccent) ? customAccent : 'transparent'}></span>
+              <input class="hex-in" spellcheck="false" maxlength="7" placeholder="#A3E635"
+                value={customAccent}
+                oninput={(e) => {
+                  const v = e.target.value.trim()
+                  if (isHex(v)) { customAccent = v; globalHue = hexToHue(v); globalHexBad = false }
+                  else globalHexBad = true
+                }} />
+            </span>
+          </label>
+          {#if globalHexBad}<p class="hint bad">Needs to be a 6-digit hex like #A3E635.</p>{/if}
           <div class="frow between"><div><b>Auto-pick text colour</b><p class="hint">Choose black/white for best contrast automatically.</p></div><button class="sw" class:on={customAuto} onclick={() => customAuto = !customAuto} aria-label="Toggle"><i></i></button></div>
           <div class="tb-preview" style:--tb-accent={customAccent} style:--tb-text={customAuto ? autoText : customText} style:--tb-soft={rgba(customAccent, 0.14)} style:--tb-border={rgba(customAccent, 0.3)}>
             <div class="tb-blade">REDZONE <span>3 / 1 / 2</span></div>
@@ -1240,7 +2159,14 @@
   {#if editing}
   <div class="editor">
     <div class="e-head"><b>{editing.id ? 'Edit Redzone' : 'Create New Redzone'}</b><button class="ib" onclick={() => editing = null} aria-label="Close"><svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></button></div>
-    <div class="e-body">
+    <div class="e-body" bind:this={eBodyEl}>
+      {#if secList.length > 2}
+        <div class="e-jump">
+          {#each secList as sc}
+            <button class="e-jump-chip" onclick={() => jumpTo(sc.id)}>{sc.label}</button>
+          {/each}
+        </div>
+      {/if}
       <label class="f"><span>{isSafe ? 'Safe Zone Name' : 'Redzone Name'}</span><input bind:value={editing.name} placeholder={isSafe ? 'e.g., Legion Square' : 'e.g., Humane Labs'} maxlength="40" /></label>
       <div class="e-sec">Zone Shape</div>
       {#if (editing.poly?.length ?? 0) >= 3}
@@ -1307,6 +2233,19 @@
         </div>
       {/each}
       <button class="btn dash" onclick={() => editing.rewardItems.push({ name: '', amount: 1 })}>+ Add Item</button>
+
+      <div class="e-sec">Kill Heal</div>
+      <div class="frow between">
+        <div><b>Full heal on kill</b><p class="hint">Every kill restores the killer to full health, whatever the amount below says.</p></div>
+        <button class="sw" class:on={editing.killHealFull === true} onclick={() => editing.killHealFull = !editing.killHealFull} aria-label="Toggle"><i></i></button>
+      </div>
+      {#if editing.killHealFull !== true}
+        <label class="f"><span>Health restored per kill <em>{(editing.killHeal ?? 0) > 0 ? '+' + editing.killHeal : 'off'}</em></span>
+          <input class="track" type="range" min="0" max="200" step="5" value={editing.killHeal ?? 0}
+            oninput={(e) => editing.killHeal = +e.target.value} />
+        </label>
+        <p class="hint">GTA health runs 0-200, so 200 is a full bar. Capped at the player's maximum — never overheals. Set to 0 to turn it off.</p>
+      {/if}
 
       <div class="e-sec">Streak Rewards</div>
       {#each editing.streakRewards as sr, i}
@@ -1427,8 +2366,6 @@
   .nav-item.admin-entry:hover { background: var(--accent-soft); color: var(--accent); }
 
   .content { flex: 1; overflow-y: auto; padding: 18px 22px 26px; display: flex; flex-direction: column; gap: 10px; scroll-behavior: smooth; }
-  /* One scrollbar look everywhere — the logs list (and any other inner
-     scroller) previously fell back to the browser default. */
   .content::-webkit-scrollbar, .e-body::-webkit-scrollbar, .logs::-webkit-scrollbar, .tab-body ::-webkit-scrollbar { width: 8px; }
   .content::-webkit-scrollbar-track, .e-body::-webkit-scrollbar-track, .logs::-webkit-scrollbar-track, .tab-body ::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
   .content::-webkit-scrollbar-thumb, .e-body::-webkit-scrollbar-thumb, .logs::-webkit-scrollbar-thumb, .tab-body ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
@@ -1508,6 +2445,7 @@
   .f { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
   .f.grow { flex: 1; }
   .w70 { width: 70px; } .w90 { width: 90px; }
+  .f input[type="color"] { height: 34px; padding: 3px; cursor: pointer; }
   .f > span { font-size: 10px; font-weight: 800; color: rgba(255,255,255,0.55); display: flex; justify-content: space-between; gap: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
   .f em { font-style: normal; color: var(--accent); text-transform: none; }
   input:not(.track), select { background: #1d2026; border: 1px solid rgba(255,255,255,0.13); border-radius: 10px; padding: 8px 11px; color: #ffffff !important; font-size: 12.5px; font-weight: 600; font-family: inherit; width: 100%; min-width: 50px; outline: none; caret-color: var(--accent); }
@@ -1600,7 +2538,6 @@
   .win-board.global { background: rgba(34,211,238,0.14); color: #22D3EE; }
   .win-prize { font-size: 11px; font-weight: 800; color: var(--accent); white-space: nowrap; }
 
-  /* Hub / Dashboard */
   .hub-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 6px; }
   .hub-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; }
   .hub-card.big { grid-column: span 3; background: linear-gradient(135deg, var(--accent-soft), rgba(255,255,255,0.02)); border-color: var(--accent-soft); }
@@ -1614,7 +2551,6 @@
   .zstat { font-weight: 800; padding: 2px 8px; border-radius: 5px; background: rgba(255,255,255,0.06); }
   .zstat.on { background: var(--accent-soft); color: var(--accent); }
 
-  /* Leaderboard tools */
   .lb-tools { display: flex; gap: 8px; margin-bottom: 8px; align-items: stretch; }
   .lb-search { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 7px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 9px; padding: 0 10px; color: var(--text-3); }
   .lb-search svg { flex-shrink: 0; }
@@ -1695,4 +2631,283 @@
   .wchip-x { background: none; border: none; color: inherit; cursor: pointer; font-size: 10px; padding: 1px 4px; opacity: 0.7; }
   .wchip-x:hover { opacity: 1; }
   .wchip-in { flex: 1; min-width: 130px; background: #101408; border: 1px solid rgba(255,255,255,0.13); border-radius: 8px; padding: 6px 9px; color: #fff; font-size: 11.5px; }
+
+  .hexrow { display: flex; align-items: center; gap: 8px; }
+  .hex-swatch { width: 22px; height: 22px; border-radius: 6px; border: 1px solid var(--border-2); flex: none; }
+  input.hex-in { width: 110px; min-width: 0; font-family: ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.04em; }
+  input.hex-native { width: 30px; min-width: 30px; height: 26px; padding: 0; border: 1px solid var(--border-2); border-radius: 6px; background: transparent; cursor: pointer; }
+  .track.hue {
+    background: linear-gradient(to right,
+      #ff0000 0%, #ffff00 17%, #00ff00 33%, #00ffff 50%, #0000ff 67%, #ff00ff 83%, #ff0000 100%);
+    border-radius: 99px;
+  }
+  .hint.bad { color: var(--danger); }
+
+  .elo-card { border-color: color-mix(in srgb, var(--tier) 35%, var(--border)); }
+  .elo-num { color: var(--tier); }
+  .hub-tier {
+    display: inline-block; margin-top: 2px; padding: 2px 9px; border-radius: 999px;
+    background: color-mix(in srgb, var(--tier) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tier) 35%, transparent);
+    color: var(--tier); font-size: 10.5px; font-weight: 900; letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .tier-head, .tier-row {
+    display: grid; grid-template-columns: 24px 30px minmax(0,1fr) 84px 50px;
+    align-items: center; gap: 6px;
+  }
+  .tier-head span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .tier-row input { min-width: 0; }
+  .tier-row input.tier-color {
+    width: 30px; min-width: 30px; height: 28px; padding: 0;
+    border: 1px solid var(--border-2); border-radius: 7px;
+    background: transparent; cursor: pointer;
+  }
+  .tier-row input.tier-min { padding: 8px 8px; font-variant-numeric: tabular-nums; }
+  .tier-row input.tier-name {
+    border-left: 3px solid var(--tier, var(--border-2));
+    font-weight: 700; padding: 8px 9px;
+  }
+  .tier-move { display: flex; flex-direction: column; gap: 2px; }
+  .tier-move button {
+    display: grid; place-items: center; width: 20px; height: 13px;
+    border: 1px solid var(--border-2); border-radius: 4px;
+    background: var(--surface-2); color: var(--text-3); cursor: pointer;
+  }
+  .tier-move button:hover:not(:disabled) { color: var(--accent); border-color: var(--accent-border); }
+  .tier-move button:disabled { opacity: 0.25; cursor: default; }
+  .tier-acts { display: flex; gap: 3px; justify-content: flex-end; }
+  .tier-ins {
+    display: grid; place-items: center; width: 22px; height: 22px;
+    border-radius: 6px; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--border-2); color: var(--text-3);
+  }
+  .tier-ins:hover { color: var(--accent); border-color: var(--accent-border); }
+  .tier-head { padding: 6px 0 2px; }
+  .tier-head span {
+    font-size: 8.5px; font-weight: 900; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--text-3);
+  }
+  .tier-row { padding: 4px 0; }
+  .tier-row.dup .tier-min { border-color: var(--danger); }
+  .tier-prev {
+    display: inline-block; justify-self: start; max-width: 100%;
+    padding: 3px 10px; border-radius: 999px;
+    background: color-mix(in srgb, var(--tier) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tier) 38%, transparent);
+    color: var(--tier);
+    font-size: 10.5px; font-weight: 900; letter-spacing: 0.05em; text-transform: uppercase;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tier-del {
+    display: grid; place-items: center; width: 22px; height: 22px;
+    border-radius: 7px; cursor: pointer;
+    background: var(--danger-soft); border: 1px solid transparent;
+    color: var(--danger);
+  }
+  .tier-del:hover { border-color: var(--danger); }
+  .pod-row {
+    display: grid; grid-template-columns: minmax(0,1fr) auto auto;
+    align-items: center; gap: 8px; padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .pod-row:last-of-type { border-bottom: none; }
+  .pod-id { display: flex; flex-direction: column; min-width: 0; }
+  .pod-id b { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pod-id .dim { font-size: 10.5px; }
+  .pod-new { display: grid; grid-template-columns: minmax(0,1fr) 150px auto; gap: 8px; margin-top: 10px; }
+
+  .winners-list::-webkit-scrollbar { width: 8px; }
+  .winners-list::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
+  .winners-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  .winners-list::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+  .btn.sm { padding: 5px 10px; font-size: 11px; }
+
+  .nav-group {
+    padding: 12px 12px 4px; font-size: 8.5px; font-weight: 900;
+    letter-spacing: 0.18em; text-transform: uppercase; color: var(--text-3);
+    user-select: none;
+  }
+
+  .e-jump {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; flex-wrap: wrap; gap: 5px;
+    padding: 8px 0 9px; margin-bottom: 4px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .e-jump-chip {
+    padding: 3px 9px; border-radius: 999px; cursor: pointer;
+    background: var(--surface-2); border: 1px solid var(--border-2);
+    color: var(--text-2); font-family: inherit;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.02em; white-space: nowrap;
+  }
+  .e-jump-chip:hover { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+  .e-sec { scroll-margin-top: 44px; }
+
+  .rank-hero {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    padding: 22px 18px 18px; margin-bottom: 12px;
+    background: linear-gradient(180deg, color-mix(in srgb, var(--tier) 14%, transparent), transparent);
+    border: 1px solid color-mix(in srgb, var(--tier) 30%, var(--border));
+    border-radius: var(--radius);
+  }
+  .rank-tier { color: var(--tier); font-size: 12px; font-weight: 900; letter-spacing: 0.16em; text-transform: uppercase; }
+  .rank-elo { color: #fff; font-size: 42px; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+  .rank-bar { width: 100%; max-width: 320px; height: 6px; margin-top: 10px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .rank-bar span { display: block; height: 100%; border-radius: 99px; background: var(--tier); transition: width 0.3s ease; }
+  .rank-next { font-size: 11.5px; font-weight: 700; color: var(--text-3); margin-top: 2px; }
+  .ladder-row { display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 8px; }
+  .ladder-row.on { background: var(--surface-2); }
+  .ladder-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .ladder-name { flex: 1 1 auto; font-size: 12.5px; font-weight: 800; color: var(--text); }
+  .ladder-min { font-size: 11.5px; font-weight: 700; color: var(--text-3); font-variant-numeric: tabular-nums; }
+
+  .gang-head, .gang-row {
+    display: grid; grid-template-columns: minmax(0,1fr) 62px 62px 62px 30px;
+    align-items: center; gap: 8px;
+  }
+  .gang-head { padding: 8px 14px 2px; }
+  .gang-head span {
+    font-size: 8.5px; font-weight: 900; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--text-3);
+  }
+  .gang-head span:not(:first-child), .gang-row .gnum { text-align: right; }
+  .gang-row { margin-bottom: 6px; }
+  .gang-id { display: flex; flex-direction: column; min-width: 0; }
+  .gang-id .dim { font-size: 10.5px; }
+  .gnum { font-size: 13px; font-weight: 800; color: var(--text); font-variant-numeric: tabular-nums; }
+  .gnum.dim { color: var(--text-3); font-weight: 700; }
+  .block.empty { text-align: center; padding: 22px 18px; }
+  .block.empty b { display: block; font-size: 13px; margin-bottom: 4px; }
+
+  .rank-grid { display: grid; grid-template-columns: 44px minmax(0,1fr) 132px 78px; align-items: center; gap: 8px; }
+  .btn.danger { background: var(--danger-soft); color: var(--danger); }
+  .btn.danger:hover, .btn.danger.confirming { background: var(--danger); color: #fff; }
+
+  .how-row { display: flex; align-items: flex-start; gap: 10px; padding: 6px 0; font-size: 12px; line-height: 1.5; color: var(--text-2); }
+  .how-row b { color: var(--text); font-weight: 800; }
+  .how-ic {
+    flex: none; display: grid; place-items: center;
+    width: 20px; height: 20px; margin-top: 1px; border-radius: 6px;
+    background: var(--surface-2); color: var(--text-3);
+    font-size: 12px; font-weight: 900;
+  }
+  .how-ic.up { background: var(--accent-soft); color: var(--accent); }
+  .how-ic.down { background: var(--danger-soft); color: var(--danger); }
+
+  .blk-toggle { padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+  .blk-toggle .hint { margin-top: 2px; }
+  .sub-sec {
+    margin: 15px 0 6px; font-size: 9px; font-weight: 900;
+    letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-3);
+  }
+  .f .fh {
+    display: block; margin-top: 4px;
+    font-size: 10.5px; font-style: normal; font-weight: 600;
+    color: var(--text-3); line-height: 1.4;
+  }
+  .hint.example {
+    padding: 8px 11px; margin-top: 8px; border-radius: var(--radius-sm);
+    background: var(--accent-soft); border: 1px solid var(--accent-border);
+    color: var(--text-2);
+  }
+  .hint.example b { color: var(--accent); font-weight: 900; }
+
+  .gang-tag {
+    display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0; min-width: 40px; height: 26px; padding: 0 8px;
+    border-radius: 8px; background: color-mix(in srgb, var(--gc) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--gc) 45%, transparent);
+    color: var(--gc); font-size: 11.5px; font-weight: 900; letter-spacing: 0.06em;
+  }
+  .gang-tag.big { min-width: 58px; height: 46px; border-radius: 12px; font-size: 17px; }
+
+  .gang-hero {
+    display: flex; align-items: center; gap: 13px;
+    padding: 14px 16px; border-radius: var(--radius);
+    background:
+      radial-gradient(120% 200% at 0% 50%, color-mix(in srgb, var(--gc) 14%, transparent), transparent 60%),
+      rgba(255,255,255,0.025);
+    border: 1px solid color-mix(in srgb, var(--gc) 28%, var(--border));
+  }
+  .gang-hero-meta { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+  .gang-hero-meta b { font-size: 17px; font-weight: 900; color: #fff; }
+  .gang-hero-meta .hint { margin: 0; }
+  .gang-hero-stats { display: flex; gap: 16px; flex-shrink: 0; }
+  .gang-hero-stats span {
+    display: flex; flex-direction: column; align-items: center; gap: 1px;
+    font-size: 9px; font-weight: 800; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--text-3);
+  }
+  .gang-hero-stats em {
+    font-style: normal; font-size: 17px; font-weight: 900; color: #fff;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .roster { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow-y: auto; }
+  .roster-row {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    padding: 6px 10px; border-radius: 10px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);
+    color: #fff; font-family: inherit; font-size: 12.5px; font-weight: 700;
+    text-align: left; cursor: pointer;
+  }
+  .roster-row:hover { background: var(--accent-soft); border-color: var(--accent-border); }
+  .roster-add {
+    flex-shrink: 0; padding: 2px 9px; border-radius: 6px;
+    background: var(--accent-soft); border: 1px solid var(--accent-border);
+    color: var(--accent); font-size: 10px; font-weight: 900;
+  }
+  .av.off { opacity: 0.45; }
+  .roster::-webkit-scrollbar { width: 8px; }
+  .roster::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
+  .roster::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  .roster::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+
+  .pos-tag {
+    display: inline-flex; align-items: center; padding: 0 10px;
+    font-size: 10.5px; font-weight: 800; color: var(--text-3);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+
+  .lbe-head, .lbe-row {
+    display: grid; grid-template-columns: 1fr 74px 74px 74px 64px;
+    gap: 7px; align-items: center;
+  }
+  .lbe-head {
+    padding: 0 10px; font-size: 9px; font-weight: 900;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-3);
+  }
+  .lbe-list { display: flex; flex-direction: column; gap: 5px; max-height: 300px; overflow-y: auto; }
+  .lbe-row {
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 10px; padding: 7px 10px;
+  }
+  .lbe-row.dirty { border-color: var(--accent-border); background: var(--accent-soft); }
+  .lbe-name {
+    display: flex; flex-direction: column; gap: 1px; min-width: 0;
+    font-size: 12px; font-weight: 800; color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .lbe-name em {
+    font-style: normal; font-size: 9.5px; font-weight: 600; color: var(--text-3);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  input.lbe-num {
+    width: 100%; padding: 5px 7px; border-radius: 8px;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08);
+    font-size: 12px; font-weight: 800;
+    font-variant-numeric: tabular-nums; text-align: center;
+  }
+  input.lbe-num:focus { border-color: var(--accent-border); }
+  .lbe-acts { display: flex; gap: 4px; justify-content: flex-end; }
+  .ib.ok { background: var(--accent-soft); border-color: var(--accent-border); color: var(--accent); }
+  .lbe-list::-webkit-scrollbar { width: 8px; }
+  .lbe-list::-webkit-scrollbar-track { background: transparent; margin: 8px 0; }
+  .lbe-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  .lbe-list::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
 </style>

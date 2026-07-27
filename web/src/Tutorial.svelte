@@ -1,16 +1,20 @@
 <script>
-  let { open = false, mode = 'admin', onstep, onclose, ondisable } = $props()
+  let { open = false, mode = 'admin', tabs = null, onstep, onclose, ondisable } = $props()
   let step = $state(0)
 
   const playerSteps = [
     { tab: 'hub', icon: '🏠', title: 'Your Hub',
-      body: 'Your home screen — see your current rank, kills, deaths, K/D, and every prize you\'ve won. Quick buttons jump you to the leaderboard, HUD, or zone colour.' },
+      body: 'Your home screen — leaderboard position, kills, deaths, K/D, prizes won, and your Redzone Elo with the tier you have reached.' },
+    { tab: 'hub', icon: '🎖️', title: 'Redzone Elo',
+      body: 'Rating is traded between you and whoever you fight. Beating someone rated above you pays well; farming someone far below you pays almost nothing. Deaths cost rating, kill streaks pay a bonus, and your tier follows your rating.' },
     { tab: 'rzleaderboard', icon: '🏆', title: 'Leaderboard',
-      body: 'Track your kills on the Redzone and Global boards. Search for any player, sort by kills or K/D, and your own row is highlighted so you can find yourself instantly. Win a weekly reset to claim a prize.' },
+      body: 'Track your kills on the Redzone and Global boards. Search any player, sort by kills or K/D, and your own row is highlighted. Win a reset to claim the prize — the top three also appear on podiums placed around the map.' },
+    { tab: 'teleport', icon: '🚀', title: 'Teleport',
+      body: 'Jump straight to any redzone that allows it. Some charge a fee, and the teleport NPCs standing near each zone do the same thing.' },
     { tab: 'color', icon: '🎨', title: 'Zone Colour',
       body: 'Set your own personal colour for the redzone dome — only you see it. Pick a hue, brightness and opacity.' },
     { tab: 'hud', icon: '📊', title: 'HUD',
-      body: 'Choose a theme, pick where the HUD sits, and resize or drag your HUD, kill feed and "Eliminated" message anywhere you like.' },
+      body: 'Pick any colour with the hue slider or by typing a hex code, choose where the HUD sits, then resize or freely drag your HUD, kill feed and "Eliminated" message.' },
   ]
 
   const adminSteps = [
@@ -22,6 +26,8 @@
       body: 'Register gangs for the gang leaderboard. Framework gangs are auto-detected; add custom ones here for standalone setups.' },
     { tab: 'resets', icon: '🏆', title: 'Leaderboards',
       body: 'Configure weekly auto-resets for the Redzone and Global boards, set the prize for #1, and reset a board instantly. Winners are recorded in Past Winners.' },
+    { tab: 'ranked', icon: '🎖️', title: 'Ranked',
+      body: 'Tune Redzone Elo — starting rating, how far one fight moves a player, the streak bonus — and edit the rank tiers players climb. Podiums live here too: place 1st/2nd/3rd peds anywhere and they mirror a board\'s top three, wearing the winners\' own outfits.' },
     { tab: 'killfeed', icon: '🎥', title: 'Feed & Cam',
       body: 'Toggle the kill feed, kill cam, and "Eliminated" message, and set how long each stays on screen.' },
     { tab: 'options', icon: '⚙️', title: 'Options',
@@ -31,8 +37,14 @@
     { tab: 'logs', icon: '📋', title: 'Logs',
       body: 'View admin, kill, and revive logs, send them to Discord webhooks, and auto-post leaderboard snapshots. Everything you set here saves to your database.' },
   ]
-  const steps = $derived(mode === 'admin' ? adminSteps : playerSteps)
+  const allSteps = $derived(mode === 'admin' ? adminSteps : playerSteps)
+  const steps = $derived.by(() => {
+    if (!Array.isArray(tabs) || tabs.length === 0) return allSteps
+    const shown = allSteps.filter(s => tabs.includes(s.tab))
+    return shown.length ? shown : allSteps
+  })
   const last = $derived(step >= steps.length - 1)
+  $effect(() => { if (step > steps.length - 1) step = 0 })
 
   $effect(() => { if (open) onstep?.(steps[step].tab) })
 

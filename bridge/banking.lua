@@ -1,12 +1,3 @@
--- Bank money bridge. Tries popular standalone banking resources first (so the
--- reason shows up in that resource's own transaction history), then falls
--- back to the framework's built-in bank account. Every call is pcall-guarded
--- since export names/signatures vary by resource version.
---
--- Self-contained framework access: server.lua's GetPlayer/FWName are locals
--- there, invisible to this file — reaching for them resolved to nil and
--- crashed the whole charge path (the "bank cost doesn't work" bug).
-
 local BFW, BFWName = nil, 'none'
 if GetResourceState('qbx_core') == 'started' then BFWName = 'qbx'
 elseif GetResourceState('qb-core') == 'started' then BFWName = 'qb'; BFW = exports['qb-core']:GetCoreObject()
@@ -54,7 +45,6 @@ function AddBank(src, amount, reason)
         if r ~= nil then return r ~= false end
     end
 
-    -- Fallback: framework's own bank account.
     local p = BGetPlayer(src)
     if not p then return false end
     if BFWName == 'qbx' or BFWName == 'qb' then

@@ -1,7 +1,3 @@
--- Logging bridge. Entries are written to their own `lime_redzones_logs` table
--- so they survive restarts and can be paged/searched from the tablet.
--- Retention (auto-wipe) and manual wipes are configured in Data.settings.logs.
-
 local ready = false
 
 local function cfg()
@@ -30,7 +26,7 @@ local function sendWebhook(url, title, description, fields)
     local embed = { {
         title = title,
         description = description,
-        color = (Config and Config.LogColor) or 10930928,
+        color = RZOption and RZOption('logColor', 10672181) or 10672181,
         fields = fields,
         footer = { text = 'lime_redzones' },
         timestamp = os.date('!%Y-%m-%dT%H:%M:%SZ'),
@@ -40,7 +36,6 @@ local function sendWebhook(url, title, description, fields)
         { ['Content-Type'] = 'application/json' })
 end
 
--- actor is optional; it's shown as its own column in the tablet.
 function Log(category, title, description, fields, actor)
     local c = cfg()
     if c.enabled == false then return end
@@ -57,7 +52,6 @@ function Log(category, title, description, fields, actor)
     sendWebhook((c.webhooks or {})[category], title, description, fields)
 end
 
--- Paged fetch. Returns newest first plus a total so the UI can page.
 function GetLogsPaged(category, page, perPage, search, done)
     if not ready then done({ entries = {}, total = 0 }) return end
     page = math.max(1, tonumber(page) or 1)
@@ -103,7 +97,6 @@ function WipeLogs(category, done)
     end
 end
 
--- Retention sweep: drop anything older than retentionDays. 0 = keep forever.
 CreateThread(function()
     while true do
         Wait(3600000)

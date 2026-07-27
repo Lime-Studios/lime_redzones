@@ -1,8 +1,5 @@
 local notifyWarned = false
 
--- GTA text codes (~g~, ~s~, ~n~ …) are only valid in native feed text; in a
--- NUI notification they render as literal junk. Strip them, and normalise
--- whatever we were handed into a clean, capped string.
 local function sanitize(message)
     message = tostring(message or '')
     message = message:gsub('~[%a]~', ''):gsub('~n~', ' ')
@@ -11,8 +8,6 @@ local function sanitize(message)
     return message
 end
 
--- Each notify resource has its own set of valid type names; an unknown type
--- falls back to that resource's default styling (often unthemed/black).
 local TYPE_MAP = {
     ox      = { info = 'inform',  success = 'success', error = 'error', warning = 'warning' },
     okok    = { info = 'info',    success = 'success', error = 'error', warning = 'warning' },
@@ -44,8 +39,6 @@ function Notify(message, ntype, duration)
         if ok then return end
     end
 
-    -- Community Bridge covers a long tail of notify resources. It sits after
-    -- the explicit handlers above so lime_notify (and ox_lib) keep priority.
     if CB and CB.active then
         local ok = pcall(function() exports.community_bridge:SendNotify(message, ntype, duration) end)
         if ok then return end

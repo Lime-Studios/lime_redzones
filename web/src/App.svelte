@@ -13,10 +13,13 @@
     display: false, mode: 'player', tab: 'rzleaderboard',
     zones: {}, gangs: {}, settings: {}, personalColor: null,
     lbData: { players: [], gangs: [], globalPlayers: [], totals: {} },
-    placementDraft: null, myIds: null, perms: null, options: {}, logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, tabletScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit', customTheme: null,
+    placementDraft: null, myIds: null, perms: null, options: {}, elo: { rating: null, rank: null, color: null }, eloRanks: [], eloEnabled: true, podiums: [], logs: [], logCategory: 'admin', logTotal: 0, logConfig: null, prizeHistory: [], firstTime: false, stats: {}, hudTheme: 'lime', hudPreset: 'top', hudScale: 1, tabletScale: 1, killfeedScale: 1, killfeedTheme: 'inherit', killmsgScale: 1, killmsgTheme: 'inherit', customTheme: null, hudLocked: false, lbEditor: { redzone: [], global: [] }, playerGangs: [], gang: null,
   })
   let killcam = $state({ display: false, killer: '', id: 0, theme: 'lime' })
-  let safezone = $state({ display: false, name: '', speedLimit: 0 })
+  let elo = $state({ rating: null, rank: null, color: null })
+  let szPos = $state(null)
+  let szMove = $state(false)
+  let safezone = $state({ display: false, name: '', speedLimit: 0, invincible: true, weapons: 'holster', phase: true })
   let placementBar = $state({ display: false, mode: 'poly', count: 0, max: 24, minZ: 0, maxZ: 0, speed: 1 })
   let kmRef
   let kfPos = $state(null)
@@ -30,18 +33,11 @@
   let kfRef
   let options = $state({})
 
-  // The static :root tokens in index.html are the lime defaults. The admin's
-  // Global Theme Builder overrides them for the whole tablet + HUD chrome
-  // whenever a custom theme is set — it's a server-wide accent, so it applies
-  // regardless of each player's per-HUD theme id. With no custom theme set,
-  // we fall back to the lime defaults.
   const DEFAULT_ROOT = {
     '--accent': '#a3e635', '--accent-strong': '#bef264',
     '--accent-soft': 'rgba(163,230,53,0.12)', '--accent-border': 'rgba(163,230,53,0.25)',
     '--accent-text': '#0f0f11',
   }
-  // A custom theme counts as "set" only if the admin actually changed it away
-  // from the lime default (so an untouched default doesn't lock out presets).
   function customIsActive() {
     const c = tablet.customTheme
     return !!(c && c.accent && c.accent.toLowerCase() !== '#a3e635')
@@ -83,6 +79,8 @@
     }
     if (d.type === 'kmMove') kmMove = !!d.enabled
     if (d.type === 'kmReset') kmPos = null
+    if (d.type === 'kfPos') kfPos = d.pos ?? null
+    if (d.type === 'kmPos') kmPos = d.pos ?? null
     if (d.type === 'killFeed') kfRef?.push(d.entry ?? {})
     if (d.type === 'killMessage') kmRef?.show(d.victim, d.weapon, d.streak)
     if (d.type === 'killCam') { killcam.display = !!d.display; killcam.killer = d.killer ?? ''; killcam.id = d.id ?? 0 }
@@ -98,12 +96,10 @@
       if (d.gangs)    tablet.gangs    = d.gangs
       if (d.settings) tablet.settings = d.settings
       if (d.perms !== undefined) tablet.perms = d.perms
+      if (d.playerGangs !== undefined) tablet.playerGangs = d.playerGangs ?? []
       if (d.options)  { tablet.options = d.options; options = d.options }
       if (d.personalColor !== undefined) tablet.personalColor = d.personalColor
       if (d.customTheme) {
-        // Admin's global theme builder pick, synced to everyone. This is the
-        // server-wide tablet/HUD accent — apply it immediately, regardless of
-        // the per-player HUD theme id.
         tablet.customTheme = d.customTheme
         setCustomTheme(d.customTheme.accent, d.customTheme.text)
         applyRootTheme()
@@ -111,6 +107,9 @@
       if (d.hudTheme)  { hud.theme = d.hudTheme; killcam.theme = d.hudTheme; tablet.hudTheme = d.hudTheme; applyRootTheme() }
       if (d.hudPreset) { hud.preset = d.hudPreset; tablet.hudPreset = d.hudPreset }
       if (d.hudScale)  { hud.scale = +d.hudScale; tablet.hudScale = +d.hudScale }
+      if (d.hudLocked !== undefined) tablet.hudLocked = !!d.hudLocked
+      if (d.hudPos !== undefined) hud.pos = d.hudPos ?? null
+      if (d.szPos !== undefined) szPos = d.szPos ?? null
       if (d.tabletScale) tablet.tabletScale = +d.tabletScale
       if (d.killfeedPos) kfPos = d.killfeedPos
       if (d.killfeedScale) { kfScale = +d.killfeedScale; tablet.killfeedScale = +d.killfeedScale }
@@ -125,17 +124,35 @@
       if (d.gangs)    tablet.gangs    = d.gangs
       if (d.settings) tablet.settings = d.settings
       if (d.perms !== undefined) tablet.perms = d.perms
+      if (d.playerGangs !== undefined) tablet.playerGangs = d.playerGangs ?? []
     }
     if (d.type === 'placementDone') {
       tablet.placementDraft = d.draft
       setTimeout(() => { tablet.placementDraft = null }, 500)
     }
     if (d.type === 'myIdentifier') tablet.myIds = { license: d.license, identifier: d.identifier }
+    if (d.type === 'lbEditor') tablet.lbEditor = { redzone: d.redzone ?? [], global: d.global ?? [] }
+    if (d.type === 'gangState') tablet.gang = d.state ?? null
     if (d.type === 'logs') { tablet.logCategory = d.category ?? 'admin'; tablet.logs = d.entries ?? []; tablet.logTotal = Number(d.total) || 0 }
     if (d.type === 'logConfig') tablet.logConfig = d.config ?? null
     if (d.type === 'prizeHistory') tablet.prizeHistory = d.history ?? []
     if (d.type === 'stats') tablet.stats = d.stats ?? {}
-    if (d.type === 'safezone') { safezone.display = !!d.display; if (d.name !== undefined) safezone.name = d.name; safezone.speedLimit = Number(d.speedLimit) || 0 }
+    if (d.type === 'eloRanks') { tablet.eloRanks = d.ranks ?? []; tablet.eloEnabled = d.enabled !== false }
+    if (d.type === 'szMove') szMove = !!d.enabled
+    if (d.type === 'szPos') szPos = d.pos ?? null
+    if (d.type === 'podiumAdmin') tablet.podiums = d.podiums ?? []
+    if (d.type === 'elo') {
+      elo = { rating: Number(d.rating) || 0, rank: d.rank ?? null, color: d.color ?? null }
+      tablet.elo = elo
+    }
+    if (d.type === 'safezone') {
+      safezone.display = !!d.display
+      if (d.name !== undefined) safezone.name = d.name
+      safezone.speedLimit = Number(d.speedLimit) || 0
+      if (d.invincible !== undefined) safezone.invincible = !!d.invincible
+      if (d.weapons !== undefined) safezone.weapons = d.weapons
+      if (d.phase !== undefined) safezone.phase = !!d.phase
+    }
     if (d.type === 'placementBar') { placementBar = { display: !!d.display, mode: d.mode ?? 'poly', count: Number(d.count) || 0, max: Number(d.max) || 24, minZ: Number(d.minZ) || 0, maxZ: Number(d.maxZ) || 0, speed: Number(d.speed) || 1 } }
     if (d.type === 'lbData') {
       tablet.lbData = {
@@ -152,10 +169,8 @@
     fetch('https://lime_redzones/closeTablet', { method: 'POST', body: '{}' })
   }
 
-  // Attach before mount so no NUI message is missed.
   window.addEventListener('message', handleMessage)
 
-  // ESC always releases focus as a safety net.
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && tablet.display) {
       tablet.display = false
@@ -165,7 +180,9 @@
 </script>
 
 <RedzoneHUD {...hud} />
-<SafeZoneHUD display={safezone.display} name={safezone.name} speedLimit={safezone.speedLimit} />
+<SafeZoneHUD display={safezone.display} name={safezone.name} speedLimit={safezone.speedLimit}
+             invincible={safezone.invincible} weapons={safezone.weapons} phase={safezone.phase}
+             scale={hud.scale} pos={szPos} moveMode={szMove} />
 <PlacementBar {...placementBar} />
 {#if options.killFeedEnabled !== false}
   <KillFeed bind:this={kfRef} pos={kfPos} moveMode={kfMove} scale={kfScale} theme={kfTheme} />
